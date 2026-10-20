@@ -1,13 +1,18 @@
 name: 'CI Retry Gate'
-description: 'Classify failed GitHub Actions jobs and safely gate reruns with provenance, side-effect checks, and retry limits.'
-author: 'othy19904-eng'
+description: 'A GitHub Action failed. Get a RETRY or INVESTIGATE decision before rerunning it.'
+author: 'achirothmane'
+
 
 inputs:
   github-token:
-    description: 'GitHub token. actions:read is required; actions:write is required only when a rerun mode is enabled.'
+    description: 'GitHub token. actions:read is required; checks:read enables authenticated runner-loss annotation fallback when job logs are missing; actions:write is required only when a rerun mode is enabled.'
     required: true
   run-id:
     description: 'Workflow run ID to inspect. Defaults to github.event.workflow_run.id.'
+    required: false
+    default: ''
+  run-attempt:
+    description: 'Optional specific historical attempt number to inspect read-only. Cannot be combined with rerun modes.'
     required: false
     default: ''
   repository:
@@ -19,7 +24,7 @@ inputs:
     required: false
     default: 'false'
   selective-rerun:
-    description: 'Rerun only individually safe high-confidence transient failed jobs. Cannot be combined with auto-rerun.'
+    description: 'Rerun at most one state-bound high-confidence transient failed job per evaluated workflow-state epoch. Cannot be combined with auto-rerun.'
     required: false
     default: 'false'
   max-attempts:
@@ -29,7 +34,7 @@ inputs:
   comment-on-pr:
     description: 'Post the gate report to the pull request when one is associated with the failed run.'
     required: false
-    default: 'true'
+    default: 'false'
   history-runs:
     description: 'Number of previous completed runs of the same workflow to inspect for recurring failures, fingerprints, rerun recovery, policy learning, shadow testing, and CI waste. Capped at 50.'
     required: false
@@ -118,17 +123,122 @@ inputs:
     default: '3'
 
 outputs:
+  decision:
+    description: 'Machine-readable authorization decision: ALLOW only when rerun evidence is sufficient; otherwise BLOCK.'
+    value: ${{ steps.gate.outputs.decision }}
+  evidence-status:
+    description: 'SUFFICIENT, CONTRADICTED, or UNKNOWN. UNKNOWN remains fail-closed.'
+    value: ${{ steps.gate.outputs.evidence-status }}
+  reason:
+    description: 'Human-readable explanation for the ALLOW/BLOCK decision.'
+    value: ${{ steps.gate.outputs.reason }}
+  decision-experience-json:
+    description: 'Descriptive-only v1 decision/value artifact with next action and final effect outcome.'
+    value: ${{ steps.effect.outputs.decision-experience-json }}
+  next-action:
+    description: 'Deterministic operator next action such as RERUN_ALLOWED, COLLECT_MORE_EVIDENCE, or INVESTIGATE_REGRESSION.'
+    value: ${{ steps.gate.outputs.next-action }}
+  observed-failed-minutes:
+    description: 'Observed runtime in minutes across the failed jobs covered by this decision; not a claimed savings number.'
+    value: ${{ steps.gate.outputs.observed-failed-minutes }}
+  rerun-eligible-jobs:
+    description: 'Failed jobs individually meeting transient/confidence/provenance/no-side-effect evidence conditions.'
+    value: ${{ steps.gate.outputs.rerun-eligible-jobs }}
+  rerun-blocked-jobs:
+    description: 'Failed jobs that do not individually meet the evidence conditions for rerun eligibility.'
+    value: ${{ steps.gate.outputs.rerun-blocked-jobs }}
+  side-effect-blocked-jobs:
+    description: 'Failed jobs carrying a side-effect boundary signal.'
+    value: ${{ steps.gate.outputs.side-effect-blocked-jobs }}
+  evidence-unavailable-jobs:
+    description: 'Failed jobs whose ordinary/eligible fallback evidence could not be acquired.'
+    value: ${{ steps.gate.outputs.evidence-unavailable-jobs }}
+  eligible-failed-minutes:
+    description: 'Observed failed-job runtime belonging to individually rerun-eligible jobs; descriptive only.'
+    value: ${{ steps.gate.outputs.eligible-failed-minutes }}
+  blocked-failed-minutes:
+    description: 'Observed failed-job runtime belonging to jobs that remained ineligible for rerun.'
+    value: ${{ steps.gate.outputs.blocked-failed-minutes }}
+  failed-jobs-json:
+    description: 'Compact JSON summary of failed-job classification, confidence, provenance, and side-effect risk.'
+    value: ${{ steps.gate.outputs.failed-jobs-json }}
+  evidence-json:
+    description: 'Compact JSON evidence contract for downstream agents, policy engines, or audit logs.'
+    value: ${{ steps.gate.outputs.evidence-json }}
+  evidence-bundle-path:
+    description: 'Filesystem path to the canonical EvidenceBundle artifact produced before authorization.'
+    value: ${{ steps.gate.outputs.evidence-bundle-path }}
+  evidence-bundle-sha256:
+    description: 'SHA-256 digest of the canonical EvidenceBundle used by the isolated authorization gate.'
+    value: ${{ steps.gate.outputs.evidence-bundle-sha256 }}
+  decision-record-path:
+    description: 'Filesystem path to the immutable Decision Evidence Record created before an optional retry mutation.'
+    value: ${{ steps.gate.outputs.decision-record-path }}
+  decision-record-sha256:
+    description: 'Canonical SHA-256 digest of the Decision Evidence Record semantic payload.'
+    value: ${{ steps.gate.outputs.decision-record-sha256 }}
+  decision-event-id:
+    description: 'Unique event identifier for the Decision Evidence Record.'
+    value: ${{ steps.gate.outputs.decision-event-id }}
+  authorization-path:
+    description: 'Authority path recorded for the decision, currently POLICY for production decisions.'
+    value: ${{ steps.gate.outputs.authorization-path }}
+  outcome-record-path:
+    description: 'Filesystem path to the immutable OutcomeRecord when a verified prior decision is observed in the next attempt.'
+    value: ${{ steps.gate.outputs.outcome-record-path }}
+  reconciliation-record-path:
+    description: 'Filesystem path to the immutable ReconciliationRecord for a verified prior decision/outcome pair.'
+    value: ${{ steps.gate.outputs.reconciliation-record-path }}
+  previous-reconciliation-status:
+    description: 'Observed reconciliation status for the verified previous attempt, or empty when no trustworthy parent chain is available.'
+    value: ${{ steps.gate.outputs.previous-reconciliation-status }}
+  eba-request-json:
+    description: 'Evidence-before-Action v0.1 ActionRequest bound to the exact CI rerun subject.'
+    value: ${{ steps.gate.outputs.eba-request-json }}
+  eba-request-sha256:
+    description: 'SHA-256 digest of the canonical EBA ActionRequest artifact.'
+    value: ${{ steps.gate.outputs.eba-request-sha256 }}
+  eba-assumption-json:
+    description: 'Evidence-before-Action v0.1 AssumptionState produced by the assumption-gate CI retry profile.'
+    value: ${{ steps.gate.outputs.eba-assumption-json }}
+  eba-assumption-sha256:
+    description: 'SHA-256 digest of the canonical EBA AssumptionState artifact.'
+    value: ${{ steps.gate.outputs.eba-assumption-sha256 }}
+  eba-authority-json:
+    description: 'Evidence-before-Action v0.1 AuthorityGrant produced by the Agent Action Guard CI retry profile.'
+    value: ${{ steps.gate.outputs.eba-authority-json }}
+  eba-authority-sha256:
+    description: 'SHA-256 digest of the canonical EBA AuthorityGrant artifact.'
+    value: ${{ steps.gate.outputs.eba-authority-sha256 }}
+  eba-decision-json:
+    description: 'Evidence-before-Action v0.1 Decision artifact authorizing or blocking the exact ActionRequest.'
+    value: ${{ steps.gate.outputs.eba-decision-json }}
+  eba-decision-sha256:
+    description: 'SHA-256 digest of the canonical EBA Decision artifact.'
+    value: ${{ steps.gate.outputs.eba-decision-sha256 }}
+  eba-receipt-json:
+    description: 'Evidence-before-Action v0.1 ExecutionReceipt produced after durable decision upload; SUCCEEDED means rerun dispatch was accepted, not that the later CI rerun passed.'
+    value: ${{ steps.effect.outputs.eba-receipt-json }}
+  eba-receipt-sha256:
+    description: 'SHA-256 digest of the final canonical EBA ExecutionReceipt artifact.'
+    value: ${{ steps.effect.outputs.eba-receipt-sha256 }}
   safe-to-rerun:
     description: 'true only when every failed job is a high-confidence transient failure and no side-effect signal is present.'
     value: ${{ steps.gate.outputs.safe-to-rerun }}
   rerun-triggered:
-    description: 'true when legacy auto-rerun was enabled and a rerun was triggered.'
-    value: ${{ steps.gate.outputs.rerun-triggered }}
+    description: 'true only when the deferred effect boundary confirmed GitHub accepted the rerun dispatch.'
+    value: ${{ steps.effect.outputs.rerun-triggered }}
+  effect-outcome:
+    description: 'Final deferred effect outcome: SUCCEEDED, NOT_EXECUTED, or UNKNOWN.'
+    value: ${{ steps.effect.outputs.effect-outcome }}
+  effect-reason:
+    description: 'Reason associated with the final deferred effect outcome.'
+    value: ${{ steps.effect.outputs.effect-reason }}
   failed-jobs:
     description: 'Number of failed jobs assessed in the current run.'
     value: ${{ steps.gate.outputs.failed-jobs }}
   wasted-minutes:
-    description: 'Observed runtime in minutes across failed jobs in the current run.'
+    description: 'Legacy output name for observed runtime across failed jobs; it does not by itself prove CI waste or savings.'
     value: ${{ steps.gate.outputs.wasted-minutes }}
   selective-safe-jobs:
     description: 'Number of failed jobs that qualified for selective safe rerun.'
@@ -137,7 +247,7 @@ outputs:
     description: 'Number of failed jobs blocked from selective rerun.'
     value: ${{ steps.selective.outputs.selective-blocked-jobs }}
   selective-reruns-triggered:
-    description: 'Number of individual job reruns requested by selective mode.'
+    description: 'Number of individual job reruns requested by selective mode in this state epoch; currently 0 or 1.'
     value: ${{ steps.selective.outputs.selective-reruns-triggered }}
   history-runs-analyzed:
     description: 'Number of previous workflow runs inspected.'
@@ -500,6 +610,21 @@ outputs:
   flaky-estimated-waste-minutes:
     description: 'Estimated test-level failed plus validating-recovery runtime across analyzed observations.'
     value: ${{ steps.flaky.outputs.flaky-estimated-waste-minutes }}
+  historical-flakiness-evidence-json:
+    description: 'Policy-free evidence for tests observed failing in the exact analyzed run attempt. Shadow/read-only; never grants rerun authority.'
+    value: ${{ steps.flaky.outputs.historical-flakiness-evidence-json }}
+  historical-flakiness-shadow-json:
+    description: 'Read-only comparison of the production retry baseline with strictly-prior flaky-test history.'
+    value: ${{ steps.flaky.outputs.historical-flakiness-shadow-json }}
+  historical-flakiness-shadow-status:
+    description: 'Shadow-only status such as HISTORICAL_SUPPORT_PRESENT, HISTORICAL_CONTRADICTION, or ORDERING_UNAVAILABLE.'
+    value: ${{ steps.flaky.outputs.historical-flakiness-shadow-status }}
+  historical-flakiness-shadow-supported-tests:
+    description: 'Current failed tests with at least two strictly-prior same-SHA recoveries and no persistent prior failure.'
+    value: ${{ steps.flaky.outputs.historical-flakiness-shadow-supported-tests }}
+  historical-flakiness-shadow-contradictions:
+    description: 'Current failed tests whose strictly-prior history contains a persistent failure revision.'
+    value: ${{ steps.flaky.outputs.historical-flakiness-shadow-contradictions }}
 
   active-quarantines:
     description: 'Number of human-approved quarantine entries currently active after fail-closed lifecycle evaluation.'
@@ -563,6 +688,13 @@ runs:
         echo "::error::auto-rerun and selective-rerun cannot both be true"
         exit 2
 
+    - name: Validate historical attempt mode
+      if: ${{ inputs.run-attempt != '' && (inputs.auto-rerun == 'true' || inputs.selective-rerun == 'true') }}
+      shell: bash
+      run: |
+        echo "::error::run-attempt is read-only and cannot be combined with rerun modes"
+        exit 2
+
     - name: Validate quarantine mode
       if: ${{ inputs.quarantine-lifecycle == 'true' && inputs.flaky-test-intelligence != 'true' }}
       shell: bash
@@ -597,11 +729,55 @@ runs:
       env:
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
         INPUT_RUN_ID: ${{ inputs.run-id }}
+        INPUT_RUN_ATTEMPT: ${{ inputs.run-attempt }}
         INPUT_REPOSITORY: ${{ inputs.repository }}
         INPUT_AUTO_RERUN: ${{ inputs.auto-rerun }}
+        INPUT_DEFER_EFFECT: 'true'
         INPUT_MAX_ATTEMPTS: ${{ inputs.max-attempts }}
         INPUT_COMMENT_ON_PR: ${{ inputs.comment-on-pr }}
       run: python3 "$GITHUB_ACTION_PATH/ci_retry_gate.py"
+
+    - name: Upload pre-effect decision audit trail
+      if: ${{ always() && steps.gate.outputs.decision-record-path != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.gate.outputs.decision-record-artifact-name }}
+        path: |
+          ${{ steps.gate.outputs.decision-record-path }}
+          ${{ steps.gate.outputs.effect-plan-path }}
+          ${{ steps.gate.outputs.outcome-record-path }}
+          ${{ steps.gate.outputs.reconciliation-record-path }}
+        if-no-files-found: error
+
+    - id: effect
+      name: Execute admitted rerun after durable audit upload
+      if: ${{ success() && steps.gate.outputs.effect-plan-path != '' }}
+      shell: bash
+      env:
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_EFFECT_PLAN_PATH: ${{ steps.gate.outputs.effect-plan-path }}
+        INPUT_EFFECT_PLAN_SHA256: ${{ steps.gate.outputs.effect-plan-sha256 }}
+        INPUT_DECISION_RECORD_PATH: ${{ steps.gate.outputs.decision-record-path }}
+        INPUT_DECISION_RECORD_SHA256: ${{ steps.gate.outputs.decision-record-sha256 }}
+        INPUT_EBA_REQUEST_PATH: ${{ steps.gate.outputs.eba-request-path }}
+        INPUT_EBA_REQUEST_SHA256: ${{ steps.gate.outputs.eba-request-sha256 }}
+        INPUT_EBA_ASSUMPTION_PATH: ${{ steps.gate.outputs.eba-assumption-path }}
+        INPUT_EBA_ASSUMPTION_SHA256: ${{ steps.gate.outputs.eba-assumption-sha256 }}
+        INPUT_EBA_AUTHORITY_PATH: ${{ steps.gate.outputs.eba-authority-path }}
+        INPUT_EBA_AUTHORITY_SHA256: ${{ steps.gate.outputs.eba-authority-sha256 }}
+        INPUT_EBA_DECISION_PATH: ${{ steps.gate.outputs.eba-decision-path }}
+        INPUT_EBA_DECISION_SHA256: ${{ steps.gate.outputs.eba-decision-sha256 }}
+        INPUT_EBA_RECEIPT_PATH: ${{ steps.gate.outputs.eba-receipt-path }}
+        INPUT_DECISION_EXPERIENCE_JSON: ${{ steps.gate.outputs.decision-experience-json }}
+      run: python3 "$GITHUB_ACTION_PATH/effect_executor.py"
+
+    - name: Upload execution receipt
+      if: ${{ always() && steps.effect.outputs.eba-receipt-path != '' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.gate.outputs.decision-record-artifact-name }}-receipt
+        path: ${{ steps.effect.outputs.eba-receipt-path }}
+        if-no-files-found: error
 
     - id: selective
       name: Selectively rerun safe failed jobs
@@ -616,6 +792,7 @@ runs:
 
     - id: history
       name: Analyze CI history, fingerprints, policies, and waste
+      if: ${{ inputs.run-attempt == '' }}
       shell: bash
       env:
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
@@ -643,6 +820,8 @@ runs:
         INPUT_QUARANTINE_MANIFEST: ${{ inputs.quarantine-manifest }}
         INPUT_QUARANTINE_MAX_DAYS: ${{ inputs.quarantine-max-days }}
         INPUT_QUARANTINE_RELEASE_CLEAN_SHAS: ${{ inputs.quarantine-release-clean-shas }}
+        INPUT_BASELINE_DECISION: ${{ steps.gate.outputs.decision }}
+        INPUT_BASELINE_EVIDENCE_STATUS: ${{ steps.gate.outputs.evidence-status }}
       run: python3 "$GITHUB_ACTION_PATH/flaky_test_history.py"
 
     - id: shadow

@@ -1,0 +1,165 @@
+# CI Retry Gate — product architecture
+
+This document describes the **product shape** of CI Retry Gate. It is intentionally different from a file-by-file research history.
+
+The public product is built around one workflow:
+
+```text
+Failed GitHub Actions run
+          |
+          v
+   Evidence collection
+          |
+          v
+ Failure + context analysis
+          |
+          +---- provenance
+          +---- exact failed execution
+          +---- side-effect risk
+          +---- retry limits
+          +---- stale/contradictory evidence
+          +---- historical evidence (when available)
+          |
+          v
+     Decision boundary
+      /      |      \
+   ALLOW   BLOCK   UNKNOWN
+      |       |        |
+      |       |        +--> investigate / gather evidence
+      |       +-----------> keep CI red / stop retry loop
+      +-------------------> bounded retry is eligible
+
+          optional write path
+                 |
+                 v
+        explicit rerun behavior
+```
+
+## Public product surface
+
+A user should be able to understand CI Retry Gate through four surfaces:
+
+| Surface | Purpose |
+|---|---|
+| `@v1` GitHub Action | Evaluate a failed workflow run |
+| Public-run analyzer | Try the decision logic without installing |
+| Setup Doctor | Check configuration before enabling write behavior |
+| Machine-readable outputs | Integrate decisions with CI automation |
+
+Everything else supports those surfaces.
+
+## Read path and write path are separate
+
+The default adoption path is read-only.
+
+```text
+observe failure
+    ↓
+collect evidence
+    ↓
+evaluate
+    ↓
+report decision
+```
+
+Only after the repository is configured intentionally can a write-capable path be enabled.
+
+That separation is part of the product design: evaluation should be useful even when the user never grants rerun authority.
+
+## What is stable
+
+The stable user-facing contract is the v1 GitHub Action surface and its documented behavior.
+
+Research code, validation harnesses, benchmark utilities, replay fixtures, and internal experiments are **not** the adoption surface and should not be treated as public API merely because they live in the repository.
+
+## Why the repository contains more than the product surface
+
+The project grew through repeated validation against failure cases, historical runs, recovery evidence, and controlled fixtures.
+
+Those assets remain valuable for:
+
+- regression testing;
+- release confidence;
+- falsification of unsafe assumptions;
+- benchmarking;
+- reproducing edge cases.
+
+The productization goal is to keep that depth **behind** a simple user journey rather than expose the entire research history as the first thing a new user must understand.
+
+## Release confidence
+
+The product is exercised through:
+
+- repository CI;
+- compatibility tests;
+- a remote stable-interface consumer;
+- public incident replay;
+- clean-install checks;
+- release smoke tests.
+
+See the main [README](../README.md) for the current release-facing claims and [technical-reference.md](technical-reference.md) for implementation detail.
+
+
+## Repository layout
+
+The repository is being organized around a visible product boundary:
+
+```text
+README.md / action.yml     product entry points
+docs/                      user and technical documentation
+examples/                  copy-ready adoption examples
+src/                       packaged product code
+tests/                     automated verification
+runtime/                   internal product runtime support
+research/                  research-only falsification and hypothesis work
+validation/                release and regression validation assets
+benchmarks / experiments   evidence and engineering evaluation
+```
+
+The first isolated research family is `research/causal_dominance/`. Moving research behind this boundary reduces root-level noise without changing the stable `@v1` action contract.
+
+
+## Validation boundary
+
+Release and regression fixtures that exercise the product but are not part of its runtime API live under `validation/`.
+
+The first isolated family is `validation/public_incidents/`, which contains the source-backed incident corpus and replay gate used by CI. This keeps release confidence visible while removing validation internals from the repository root.
+
+
+## Dependency direction
+
+The repository boundary is directional:
+
+```text
+research/   ─┐
+             ├──> product runtime
+validation/ ─┘
+
+product runtime -X-> research/
+product runtime -X-> validation/
+```
+
+Research and validation are allowed to exercise product modules. Product runtime must not import either internal layer. CI enforces this rule with an AST-based repository-boundary test.
+
+Some root modules have research-oriented names but are currently part of an opt-in product execution path and therefore are **not safe to move merely by name**:
+
+- `benchmark_mode.py` is invoked by the public `benchmark-mode` action input and imports `classifier_rule_research.py`, `server5xx_counterexample_search.py`, and `targeted_replication_search.py`.
+- `flaky_test_history.py` is an Action runtime entry point; its historical-evidence and shadow support now live under `runtime/flaky/`.
+
+Root entry points stay visible when `action.yml` invokes them directly, while their implementation detail moves into `runtime/`.
+
+
+## Benchmark runtime package
+
+The public Action still invokes `benchmark_mode.py` as a stable root entry point, but its benchmark-specific support modules live under `runtime/benchmark/`.
+
+This keeps the entry point obvious while moving implementation detail out of the product root. The moved modules remain product runtime because the opt-in `benchmark-mode` path executes them indirectly; they are not reclassified as research merely because some of their functions are shadow/read-only.
+
+Unknown-failure decomposition, promotion checks, and independent-replication analysis also live in `runtime/benchmark/` because they are implementation details of Benchmark Mode rather than standalone public entry points.
+
+
+## Flaky-test runtime package
+
+The public Action continues to invoke `flaky_test_history.py` as its stable entry point. Its analysis, ownership, quarantine lifecycle, triage, issue lifecycle, historical evidence, and read-only shadow support live under `runtime/flaky/`.
+
+The adapter-facing `quarantine_enforcement.py` remains a root entry point because the pytest/Jest/Vitest composite actions invoke it directly. This mirrors the benchmark structure: stable root entry points, internal runtime packages behind them.

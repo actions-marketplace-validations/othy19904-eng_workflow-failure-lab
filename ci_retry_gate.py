@@ -4,25 +4,74 @@ import http.client
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
+from easl_state_binding import (
+    StateBinding,
+    StateBindingError,
+    evaluate_required_state_bindings,
+)
+from evidence_artifact import write_evidence_artifact
+from evidence_producer import produce_ci_evidence_bundle
+from ci_assumption_profile import build_ci_retry_assumption_state
+from ci_authority_profile import build_ci_authority_grant
+from decision_experience import build_decision_experience, render_decision_card
+from decision_history import (
+    DecisionHistoryError,
+    download_prior_audit_trail,
+    find_previous_decision_artifact,
+)
+from decision_identity import collect_decision_identities
+from decision_record import (
+    build_decision_record,
+    decision_parent_ref,
+    write_decision_record,
+)
+from effect_plan import build_effect_plan, write_effect_plan
+from outcome_record import (
+    bind_parent_decision_to_attempt,
+    build_outcome_record,
+    build_reconciliation_record,
+    seal_audit_record,
+    write_outcome_record,
+    write_reconciliation_record,
+)
+from eba_integration_contract import (
+    ContractViolation,
+    build_ci_action_request,
+    build_decision_artifact,
+    build_execution_receipt,
+    ensure_decision_allows_request,
+    write_contract_artifact,
+)
+
 TRANSIENT_CATEGORIES = {"RUNNER_INFRA", "DEPENDENCY_NETWORK"}
-FAILURE_CONCLUSIONS = {"failure", "timed_out", "cancelled"}
+FAILURE_CONCLUSIONS = {"failure", "timed_out"}
+PRODUCTION_POLICY_REF = "ci-retry-gate.production.v1"
+
 
 _SECRET_PATTERNS = [
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._~+\-/]+=*"),
-    re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s]+"),
+    ("github_legacy_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b")),
+    ("github_fine_grained_token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
+    ("aws_access_key_id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    (
+        "authorization_bearer",
+        re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._~+\-/]+=*"),
+    ),
+    (
+        "credential_assignment",
+        re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s]+"),
+    ),
 ]
 
 # GitHub logs can contain terminal color/control sequences inside error lines.
@@ -49,6 +98,19 @@ _RUNNER_TIMESTAMP_CAPTURE_RE = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+"
 )
 
+
+# This path is used only when the ordinary job-log evidence is unavailable.
+# Keep the accepted message narrow: GitHub Actions emits this annotation when
+# the job's runner stops communicating with the service. The annotation is not
+# treated as root-cause proof; it is an exact job/check-run-bound transient
+# signal and still remains subject to side-effect and attempt gates.
+_RUNNER_LOSS_CHECK_ANNOTATION_RE = re.compile(
+    r"^The (?:hosted|self-hosted) runner"
+    r"(?:\s*:\s*[^\r\n.]{1,160})?"
+    r" lost communication with the server\.",
+    re.IGNORECASE,
+)
+
 _NON_CAUSAL_LOG_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in [
@@ -67,7 +129,7 @@ _CAUSAL_OPERATIONAL_PATTERNS = tuple(
         r"^::error::",
         r"^(?:error|fatal|exception|panic)\b\s*[:!]",
         r"^npm (?:err!|error)\b",
-        r"^curl:\s*\(\d+\)",
+        r"^(?:\[[^\]\r\n]{1,80}\]\s+)?curl:\s*\(\d+\)",
         r"^read tcp\b",
         r"^dial tcp\b",
         r"^traceback \(most recent call last\):",
@@ -133,16 +195,27 @@ _CATEGORY_RULES: dict[str, tuple[tuple[int, re.Pattern[str]], ...]] = {
     ),
 }
 
+# A runner shutdown line is a terminal symptom, not independent proof that
+# infrastructure caused the failure. Workload/resource behavior can surface as
+# the same SIGTERM/exit-143 shutdown sequence, so this signal alone must never
+# promote a retry to high confidence.
+_RUNNER_TERMINAL_SYMPTOM_RULES = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in [
+        r"the runner has received a shutdown signal",
+        r"process completed with exit code 143",
+    ]
+)
+
 # These signatures are intentionally narrower than the scoring rules above.
 # A single occurrence may be enough for high confidence only when it looks like
-# an operational failure emitted by a network/client stack, rather than prose,
-# documentation, a source fixture, or a generic timeout word.
+# independent operational evidence emitted by the runner/network substrate,
+# rather than prose, documentation, a source fixture, or a terminal symptom.
 _HIGH_SPECIFICITY_TRANSIENT_RULES: dict[str, tuple[re.Pattern[str], ...]] = {
     "RUNNER_INFRA": tuple(
         re.compile(pattern, re.IGNORECASE)
         for pattern in [
             r"lost communication with the server",
-            r"the runner has received a shutdown signal",
             r"hosted runner .* (shutdown|unavailable|failed)",
         ]
     ),
@@ -152,7 +225,10 @@ _HIGH_SPECIFICITY_TRANSIENT_RULES: dict[str, tuple[re.Pattern[str], ...]] = {
             r"\bnpm (?:err!|error) code (?:econnreset|etimedout|eai_again)\b",
             r"\bread tcp\b.*\bread:\s*connection reset by peer\b",
             r"\bdial tcp\b.*(?:i/o timeout|connect:\s*(?:connection timed out|network is unreachable|connection refused))",
-            r"\bcurl:\s*\((?:6|7|28|35|56)\)\b",
+            r"^(?:\[[^\]\r\n]{1,80}\]\s+)?curl:\s*\((?:6|7|28|35|56)\)(?:\s|$)",
+            r"^(?:##\[error\].*|error:.*)\bunexpected status from "
+            r"(?:head|get|post|put|delete) request to https?://\S+:\s*"
+            r"(?:502 bad gateway|503 service unavailable|504 gateway timeout)",
             r"\bfatal: unable to access\b.*(?:could not resolve host|recv failure: connection reset by peer|failed to connect|operation timed out)",
             r"\b(?:error|fatal):\s*connection reset by peer\b",
             r"\bconnect etimedout\b",
@@ -189,6 +265,7 @@ class Classification:
     confidence: str
     score: int
     evidence: tuple[str, ...]
+    fields_redacted: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -223,13 +300,25 @@ class JobAssessment:
     side_effect_risk: bool
     side_effect_evidence: tuple[str, ...]
     duration_minutes: float
+    masking_fields_redacted: tuple[str, ...] = ()
+
+
+def redact_with_provenance(text: str) -> tuple[str, tuple[str, ...]]:
+    """Redact credential material and report which masking rules matched."""
+    value = text
+    fields_redacted: set[str] = set()
+    for field_name, pattern in _SECRET_PATTERNS:
+        if pattern.search(text):
+            fields_redacted.add(field_name)
+        value = pattern.sub(
+            lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]",
+            value,
+        )
+    return value, tuple(sorted(fields_redacted))
 
 
 def redact(text: str) -> str:
-    value = text
-    for pattern in _SECRET_PATTERNS:
-        value = pattern.sub(lambda m: (m.group(1) if m.lastindex else "") + "[REDACTED]", value)
-    return value
+    return redact_with_provenance(text)[0]
 
 
 def _useful_line(line: str) -> str:
@@ -261,14 +350,21 @@ def classify_log(log_text: str) -> Classification:
     strong_transient_evidence: dict[str, list[str]] = {
         name: [] for name in _HIGH_SPECIFICITY_TRANSIENT_RULES
     }
+    runner_terminal_symptom = False
 
     seen_lines: set[str] = set()
+    fields_redacted: set[str] = set()
     for raw_line in log_text.splitlines():
-        line = _useful_line(raw_line)
+        redacted_line, redacted_fields = redact_with_provenance(raw_line)
+        fields_redacted.update(redacted_fields)
+        line = _useful_line(redacted_line)
         role = causal_evidence_role(line)
         if not line or role == NON_CAUSAL or line in seen_lines:
             continue
         seen_lines.add(line)
+
+        if any(pattern.search(line) for pattern in _RUNNER_TERMINAL_SYMPTOM_RULES):
+            runner_terminal_symptom = True
 
         for category, rules in _CATEGORY_RULES.items():
             for weight, pattern in rules:
@@ -297,7 +393,13 @@ def classify_log(log_text: str) -> Classification:
     second_score = ranked[1][1]
 
     if top_score < 3:
-        return Classification("UNKNOWN", "low", top_score, tuple())
+        return Classification(
+            "UNKNOWN",
+            "low",
+            top_score,
+            tuple(),
+            tuple(sorted(fields_redacted)),
+        )
 
     margin = top_score - second_score
     if top_score >= 7 and margin >= 3:
@@ -314,10 +416,33 @@ def classify_log(log_text: str) -> Classification:
     ):
         confidence = "high"
 
+    if (
+        top_category == "RUNNER_INFRA"
+        and runner_terminal_symptom
+        and not strong_transient_evidence.get("RUNNER_INFRA")
+    ):
+        confidence = "medium" if top_score >= 4 else "low"
+
     if top_category == "CODE_REGRESSION" and top_score < 7:
         confidence = "medium" if top_score >= 4 else "low"
 
-    return Classification(top_category, confidence, top_score, tuple(evidence[top_category]))
+    return Classification(
+        top_category,
+        confidence,
+        top_score,
+        tuple(evidence[top_category]),
+        tuple(sorted(fields_redacted)),
+    )
+
+
+def _metadata_redacted_fields(job: dict) -> tuple[str, ...]:
+    fields_redacted: set[str] = set()
+    candidates = [str(job.get("name") or "")]
+    candidates.extend(str(step.get("name") or "") for step in job.get("steps") or [])
+    for candidate in candidates:
+        _, matched = redact_with_provenance(candidate)
+        fields_redacted.update(matched)
+    return tuple(sorted(fields_redacted))
 
 
 def detect_side_effect_risk(job: dict) -> tuple[bool, tuple[str, ...]]:
@@ -497,6 +622,158 @@ def assess_execution_provenance(
     )
 
 
+def _check_run_id_from_job(job: dict) -> int | None:
+    raw_url = str(job.get("check_run_url") or "").strip()
+    if not raw_url:
+        return None
+    try:
+        path = urlparse(raw_url).path
+    except ValueError:
+        return None
+    match = re.search(r"/repos/[^/]+/[^/]+/check-runs/(?P<id>\d+)$", path)
+    if not match:
+        return None
+    try:
+        return int(match.group("id"))
+    except ValueError:
+        return None
+
+
+def _assess_runner_annotations(
+    job: dict,
+    check_run: dict,
+    annotations: Iterable[dict],
+    *,
+    source_label: str,
+) -> JobAssessment | None:
+    """Build retry evidence from an exactly-bound GitHub Actions check annotation.
+
+    This is deliberately a fallback for missing job logs, not a parallel source
+    that can override ordinary step-bound log evidence. Authorization requires
+    an exact binding between the workflow job and the GitHub Actions check run:
+    check-run id, job name, head SHA, conclusion, and app identity.
+    """
+    job_id = int(job.get("id") or 0)
+    check_run_id = _check_run_id_from_job(job)
+    if job_id <= 0 or check_run_id is None:
+        return None
+
+    try:
+        observed_check_id = int(check_run.get("id") or 0)
+    except (TypeError, ValueError):
+        return None
+    if observed_check_id != check_run_id:
+        return None
+
+    job_name = str(job.get("name") or "")
+    if not job_name or str(check_run.get("name") or "") != job_name:
+        return None
+
+    job_head_sha = str(job.get("head_sha") or "").strip()
+    check_head_sha = str(check_run.get("head_sha") or "").strip()
+    if not job_head_sha or not check_head_sha or check_head_sha != job_head_sha:
+        return None
+
+    job_conclusion = str(job.get("conclusion") or "").lower()
+    check_conclusion = str(check_run.get("conclusion") or "").lower()
+    if (
+        job_conclusion not in FAILURE_CONCLUSIONS
+        or check_conclusion != job_conclusion
+        or str(check_run.get("status") or "").lower() != "completed"
+    ):
+        return None
+
+    app = check_run.get("app")
+    if not isinstance(app, dict) or str(app.get("slug") or "").lower() != "github-actions":
+        return None
+
+    messages: list[str] = []
+    fields_redacted: set[str] = set()
+    for annotation in annotations:
+        if not isinstance(annotation, dict):
+            continue
+        if str(annotation.get("annotation_level") or "").lower() != "failure":
+            continue
+        raw_message = str(annotation.get("message") or "").strip()
+        if not _RUNNER_LOSS_CHECK_ANNOTATION_RE.search(raw_message):
+            continue
+        redacted_message, matched_fields = redact_with_provenance(raw_message)
+        fields_redacted.update(matched_fields)
+        cleaned = _useful_line(redacted_message)
+        if cleaned and cleaned not in messages:
+            messages.append(cleaned)
+
+    if not messages:
+        return None
+
+    classification = classify_log("\n".join(messages))
+    if (
+        classification.category != "RUNNER_INFRA"
+        or classification.confidence != "high"
+    ):
+        return None
+
+    failure_step = assess_failure_step_provenance(job)
+    side_effect_risk, side_effect_evidence = detect_side_effect_risk(job)
+    proof = (
+        f"source: {source_label}",
+        f"check_run_id: {check_run_id}",
+        "check app: github-actions",
+        f"head_sha matched: {job_head_sha}",
+        f"signal: {messages[0]}",
+    )
+    return JobAssessment(
+        job_id=job_id,
+        name=job_name,
+        category=classification.category,
+        confidence=classification.confidence,
+        evidence=classification.evidence,
+        provenance_status=PROVENANCE_CONFIRMED,
+        provenance_step="",
+        provenance_command="",
+        provenance_evidence=proof,
+        failure_step_status=failure_step.status,
+        failure_step=failure_step.step_name,
+        failure_step_evidence=failure_step.evidence,
+        side_effect_risk=side_effect_risk,
+        side_effect_evidence=side_effect_evidence,
+        duration_minutes=job_duration_minutes(job),
+        masking_fields_redacted=tuple(
+            sorted(
+                fields_redacted
+                | set(classification.fields_redacted)
+                | set(_metadata_redacted_fields(job))
+            )
+        ),
+    )
+
+
+def assess_authenticated_runner_annotations(
+    job: dict,
+    check_run: dict,
+    annotations: Iterable[dict],
+) -> JobAssessment | None:
+    return _assess_runner_annotations(
+        job,
+        check_run,
+        annotations,
+        source_label="authenticated GitHub Checks annotation",
+    )
+
+
+def assess_public_runner_annotations(
+    job: dict,
+    check_run: dict,
+    annotations: Iterable[dict],
+) -> JobAssessment | None:
+    return _assess_runner_annotations(
+        job,
+        check_run,
+        annotations,
+        source_label="public GitHub Checks annotation",
+    )
+
+
 def assess_job(job: dict, log_text: str) -> JobAssessment:
     classification = classify_log(log_text)
     provenance = assess_execution_provenance(job, log_text, classification)
@@ -518,34 +795,311 @@ def assess_job(job: dict, log_text: str) -> JobAssessment:
         side_effect_risk=side_effect_risk,
         side_effect_evidence=side_effect_evidence,
         duration_minutes=job_duration_minutes(job),
+        masking_fields_redacted=tuple(
+            sorted(
+                set(classification.fields_redacted)
+                | set(_metadata_redacted_fields(job))
+            )
+        ),
     )
 
 
-def rerun_decision(assessments: Iterable[JobAssessment], run_attempt: int, max_attempts: int) -> tuple[bool, str]:
-    items = list(assessments)
-    if not items:
-        return False, "No failed jobs were available to assess."
-    if run_attempt >= max_attempts:
-        return False, f"Run attempt {run_attempt} reached max_attempts={max_attempts}."
-    if any(item.side_effect_risk for item in items):
-        return False, "At least one failed job contains a side-effect signal; blind rerun is blocked."
-    unsafe = [
-        item for item in items
-        if item.category not in TRANSIENT_CATEGORIES or item.confidence != "high"
+def _normalized_job_stem(name: str) -> str:
+    """Normalize an explicit primary/retry job identity conservatively."""
+    def normalize_component(value: str) -> str:
+        value = value.lower()
+        value = re.sub(r"\bre-?try\b", "", value)
+        value = re.sub(r"[_\-]+", " ", value)
+        value = re.sub(r"[()\[\]]+", " ", value)
+        value = re.sub(r"\s+", " ", value)
+        return value.strip()
+
+    parts = [normalize_component(part) for part in name.split("/")]
+    parts = [part for part in parts if part]
+    return " / ".join(parts)
+
+
+def _job_identity_matches(primary_name: str, retry_name: str) -> bool:
+    primary_parts = [part.strip() for part in _normalized_job_stem(primary_name).split(" / ")]
+    retry_parts = [part.strip() for part in _normalized_job_stem(retry_name).split(" / ")]
+    if not primary_parts or not retry_parts:
+        return False
+    if len(primary_parts) > 1 and len(retry_parts) > 1:
+        return primary_parts[-1] == retry_parts[-1]
+    return primary_parts == retry_parts
+
+def detect_recovered_failures(failed_jobs: Iterable[dict], jobs: Iterable[dict]) -> dict[int, str]:
+    """Return failed job ids that have an explicit successful retry counterpart.
+
+    Metadata-only recovery is accepted only when the successful job explicitly
+    identifies itself as a retry and its normalized display name matches the
+    failed primary. This prevents 'some later job succeeded' from becoming
+    recovery evidence.
+    """
+    successful = [
+        job for job in jobs
+        if str(job.get("conclusion") or "").lower() == "success"
+        and re.search(r"\bretry\b|re-?try", str(job.get("name") or ""), re.IGNORECASE)
     ]
-    if unsafe:
-        names = ", ".join(f"{item.name}={item.category}/{item.confidence}" for item in unsafe)
-        return False, f"Not every failed job is a high-confidence transient failure: {names}."
-    unproven = [
-        item for item in items
-        if item.provenance_status != PROVENANCE_CONFIRMED
+    recovered: dict[int, str] = {}
+    for failed in failed_jobs:
+        failed_name = str(failed.get("name") or "")
+        failed_stem = _normalized_job_stem(failed_name)
+        if not failed_stem:
+            continue
+        for retry in successful:
+            retry_name = str(retry.get("name") or "")
+            if _job_identity_matches(failed_name, retry_name):
+                recovered[int(failed.get("id") or 0)] = retry_name
+                break
+    return recovered
+
+
+def detect_cross_attempt_recovery(failed_jobs: Iterable[dict], later_jobs: Iterable[dict]) -> dict[int, str]:
+    """Match failed jobs to successful jobs with the same identity in a later attempt."""
+    successful = [
+        job for job in later_jobs
+        if str(job.get("conclusion") or "").lower() == "success"
     ]
-    if unproven:
-        names = ", ".join(
-            f"{item.name}={item.provenance_status}" for item in unproven
+    recovered: dict[int, str] = {}
+    for failed in failed_jobs:
+        failed_name = str(failed.get("name") or "")
+        if not failed_name:
+            continue
+        for later in successful:
+            later_name = str(later.get("name") or "")
+            if _normalized_job_stem(failed_name) == _normalized_job_stem(later_name):
+                recovered[int(failed.get("id") or 0)] = later_name
+                break
+    return recovered
+
+
+
+def detect_cross_attempt_recurrence(failed_jobs: Iterable[dict], later_jobs: Iterable[dict]) -> dict[int, str]:
+    """Match a failed job identity that fails again in the next attempt."""
+    failed_later = [job for job in later_jobs if str(job.get("conclusion") or "").lower() in FAILURE_CONCLUSIONS]
+    recurrent: dict[int, str] = {}
+    for failed in failed_jobs:
+        failed_name = str(failed.get("name") or "")
+        for later in failed_later:
+            later_name = str(later.get("name") or "")
+            if failed_name and _normalized_job_stem(failed_name) == _normalized_job_stem(later_name):
+                recurrent[int(failed.get("id") or 0)] = later_name
+                break
+    return recurrent
+
+
+def historical_reliability_record(
+    current_failed_jobs: Iterable[dict],
+    prior_incidents: Iterable[dict],
+    cutoff: str,
+) -> dict:
+    """Summarize only machine-verified recoveries observed before the current failure.
+
+    History is supporting evidence. It never authorizes a rerun by itself.
+    Each incident must carry observed_at, failed_jobs, and later_jobs metadata.
+    """
+    identities = {
+        _normalized_job_stem(str(job.get("name") or ""))
+        for job in current_failed_jobs
+        if str(job.get("name") or "")
+    }
+    verified: list[dict] = []
+    for incident in prior_incidents:
+        observed_at = str(incident.get("observed_at") or "")
+        if not observed_at or observed_at >= cutoff:
+            continue
+        failed = list(incident.get("failed_jobs") or [])
+        later = list(incident.get("later_jobs") or [])
+        recovered = detect_cross_attempt_recovery(failed, later)
+        for job in failed:
+            job_id = int(job.get("id") or 0)
+            identity = _normalized_job_stem(str(job.get("name") or ""))
+            if identity in identities and job_id in recovered:
+                verified.append({
+                    "run_id": int(incident.get("run_id") or 0),
+                    "identity": identity,
+                    "observed_at": observed_at,
+                    "recovered_as": recovered[job_id],
+                })
+    unique_incidents = {
+        (item["run_id"], item["observed_at"])
+        for item in verified
+    }
+    by_identity: dict[str, int] = {}
+    for item in verified:
+        by_identity[item["identity"]] = by_identity.get(item["identity"], 0) + 1
+    latest = max((item["observed_at"] for item in verified), default=None)
+    return {
+        "status": "SUPPORTING_EVIDENCE" if verified else "INSUFFICIENT_HISTORY",
+        "verified_prior_recoveries": len(verified),
+        "verified_prior_incidents": len(unique_incidents),
+        "recoveries_by_identity": by_identity,
+        "latest_verified_recovery_at": latest,
+        "cutoff": cutoff,
+        "authorization": "NOT_AUTHORIZING",
+        "recoveries": verified,
+    }
+
+
+def collect_historical_reliability(
+    api: "GitHubAPI",
+    repo: str,
+    current_run: dict,
+    current_failed_jobs: Iterable[dict],
+    *,
+    max_pages: int = 4,
+    per_page: int = 100,
+    max_candidate_runs: int = 12,
+) -> dict:
+    """Collect pre-failure recovery history with a bounded API evidence budget.
+
+    Stage 1 is cheap workflow-list discovery. Stage 2 spends attempt/job calls
+    only on list records that already report multiple attempts. Rate limiting is
+    evidence unavailability, never a reason to authorize execution.
+    """
+    cutoff = str(current_run.get("created_at") or "")
+    workflow_id = int(current_run.get("workflow_id") or 0)
+    if not cutoff or not workflow_id:
+        return historical_reliability_record(current_failed_jobs, [], cutoff)
+
+    candidates: list[dict] = []
+    pages_examined = 0
+    rate_limited = False
+    try:
+        for page in range(1, max_pages + 1):
+            batch = api.get_workflow_runs(repo, workflow_id, per_page=per_page, page=page)
+            pages_examined += 1
+            if not batch:
+                break
+            for run in batch:
+                if (
+                    str(run.get("created_at") or "") < cutoff
+                    and int(run.get("id") or 0) != int(current_run.get("id") or 0)
+                    and int(run.get("run_attempt") or 1) > 1
+                ):
+                    candidates.append(run)
+                    if len(candidates) >= max_candidate_runs:
+                        break
+            if len(candidates) >= max_candidate_runs or len(batch) < per_page:
+                break
+    except RuntimeError as exc:
+        if "rate limit exceeded" in str(exc).lower():
+            rate_limited = True
+        else:
+            raise
+
+    incidents: list[dict] = []
+    inspected = 0
+    for prior in candidates[:max_candidate_runs]:
+        prior_id = int(prior.get("id") or 0)
+        final_attempt = int(prior.get("run_attempt") or 1)
+        try:
+            first_jobs = api.get_jobs_attempt(repo, prior_id, 1)
+            later_jobs = api.get_jobs_attempt(repo, prior_id, final_attempt)
+        except RuntimeError as exc:
+            if "rate limit exceeded" in str(exc).lower():
+                rate_limited = True
+                break
+            raise
+        inspected += 1
+        failed = [
+            job for job in first_jobs
+            if str(job.get("conclusion") or "").lower() in FAILURE_CONCLUSIONS
+        ]
+        if failed:
+            incidents.append({
+                "run_id": prior_id,
+                "observed_at": str(prior.get("created_at") or ""),
+                "failed_jobs": failed,
+                "later_jobs": later_jobs,
+            })
+
+    record = historical_reliability_record(current_failed_jobs, incidents, cutoff)
+    if rate_limited and not record["verified_prior_recoveries"]:
+        record["status"] = "EVIDENCE_RATE_LIMITED"
+    record["workflow_id"] = workflow_id
+    record["pages_examined"] = pages_examined
+    record["candidate_runs"] = len(candidates)
+    record["candidate_runs_inspected"] = inspected
+    record["evidence_budget_exhausted"] = (
+        rate_limited or pages_examined >= max_pages or len(candidates) >= max_candidate_runs
+    )
+    return record
+
+
+def _evidence_artifact_path(repo: str, run_id: int, run_attempt: int) -> Path:
+    root = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir())
+    directory = root / "ci-retry-gate-evidence"
+    safe_repo = re.sub(r"[^A-Za-z0-9_.-]+", "-", repo).strip("-") or "repository"
+    return directory / f"{safe_repo}-run-{run_id}-attempt-{run_attempt}.evidence.json"
+
+
+def _decision_record_path(evidence_path: Path) -> Path:
+    return evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".decision-record.json")
+    )
+
+
+def _outcome_record_path(evidence_path: Path) -> Path:
+    return evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".outcome-record.json")
+    )
+
+
+def _reconciliation_record_path(evidence_path: Path) -> Path:
+    return evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".reconciliation-record.json")
+    )
+
+
+def _effect_plan_path(evidence_path: Path) -> Path:
+    return evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".effect-plan.json")
+    )
+
+
+def _run_evidence_gate_process(
+    evidence_path: Path,
+    evidence_sha256: str,
+    max_attempts: int,
+) -> dict:
+    """Invoke the authorization gate in a separate Python process."""
+    gate_cli = Path(__file__).with_name("evidence_gate_cli.py")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(gate_cli),
+            "--evidence",
+            str(evidence_path),
+            "--expected-sha256",
+            evidence_sha256,
+            "--max-attempts",
+            str(max_attempts),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        raise RuntimeError(
+            "Evidence gate process failed closed"
+            + (f": {stderr}" if stderr else "")
         )
-        return False, f"Execution provenance was not confirmed for: {names}."
-    return True, "All failed jobs are high-confidence transient failures with confirmed execution provenance and no side-effect signal was found."
+    try:
+        decision = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Evidence gate returned invalid JSON") from exc
+    if not isinstance(decision, dict):
+        raise RuntimeError("Evidence gate returned a non-object decision")
+    if decision.get("decision") not in {"ALLOW", "BLOCK"}:
+        raise RuntimeError("Evidence gate returned an invalid authorization decision")
+    reasons = decision.get("reasons")
+    if not isinstance(reasons, list) or not reasons:
+        raise RuntimeError("Evidence gate returned no decision reason")
+    return decision
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -574,17 +1128,19 @@ class GitHubAPI:
         last_transport_error: BaseException | None = None
 
         for attempt in range(1, attempts + 1):
+            headers = {
+                "Accept": accept,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "ci-retry-gate-action",
+                "Content-Type": "application/json",
+            }
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
             req = urllib.request.Request(
                 f"{self.api_url}{path}",
                 data=data,
                 method=method,
-                headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "Accept": accept,
-                    "X-GitHub-Api-Version": "2022-11-28",
-                    "User-Agent": "ci-retry-gate-action",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
             )
             try:
                 with self.opener.open(req, timeout=30) as response:
@@ -626,15 +1182,17 @@ class GitHubAPI:
         last_transport_error: BaseException | None = None
 
         for attempt in range(1, attempts + 1):
+            headers = {
+                "Accept": accept,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "ci-retry-gate-action",
+            }
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
             req = urllib.request.Request(
                 f"{self.api_url}{path}",
                 method=method,
-                headers={
-                    "Authorization": f"Bearer {self.token}",
-                    "Accept": accept,
-                    "X-GitHub-Api-Version": "2022-11-28",
-                    "User-Agent": "ci-retry-gate-action",
-                },
+                headers=headers,
             )
             try:
                 with self.opener.open(req, timeout=30) as response:
@@ -661,15 +1219,87 @@ class GitHubAPI:
             f"{type(last_transport_error).__name__}: {last_transport_error}"
         ) from last_transport_error
 
+    def get_repository(self, repo: str) -> dict:
+        return self.request("GET", f"/repos/{repo}")
+
     def get_run(self, repo: str, run_id: int) -> dict:
         return self.request("GET", f"/repos/{repo}/actions/runs/{run_id}")
+
+    def get_run_attempt(self, repo: str, run_id: int, run_attempt: int) -> dict:
+        return self.request("GET", f"/repos/{repo}/actions/runs/{run_id}/attempts/{run_attempt}")
 
     def get_jobs(self, repo: str, run_id: int) -> list[dict]:
         data = self.request("GET", f"/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
         return list(data.get("jobs") or [])
 
+    def get_workflow_runs(self, repo: str, workflow_id: int, per_page: int = 100, page: int = 1) -> list[dict]:
+        data = self.request(
+            "GET",
+            f"/repos/{repo}/actions/workflows/{workflow_id}/runs?per_page={per_page}&page={page}",
+        )
+        return list(data.get("workflow_runs") or [])
+
+    def get_jobs_attempt(self, repo: str, run_id: int, run_attempt: int) -> list[dict]:
+        data = self.request(
+            "GET",
+            f"/repos/{repo}/actions/runs/{run_id}/attempts/{run_attempt}/jobs?per_page=100",
+        )
+        return list(data.get("jobs") or [])
+
+    def get_check_run(self, repo: str, check_run_id: int) -> dict:
+        data = self.request("GET", f"/repos/{repo}/check-runs/{check_run_id}")
+        if not isinstance(data, dict):
+            raise RuntimeError("GitHub Checks API returned a non-object check run")
+        return data
+
+    def get_check_run_annotations(
+        self,
+        repo: str,
+        check_run_id: int,
+        *,
+        max_pages: int = 5,
+    ) -> list[dict]:
+        annotations: list[dict] = []
+        for page in range(1, max_pages + 1):
+            data = self.request(
+                "GET",
+                f"/repos/{repo}/check-runs/{check_run_id}/annotations"
+                f"?per_page=100&page={page}",
+            )
+            if not isinstance(data, list):
+                raise RuntimeError(
+                    "GitHub Checks API returned a non-array annotation response"
+                )
+            annotations.extend(item for item in data if isinstance(item, dict))
+            if len(data) < 100:
+                return annotations
+        raise RuntimeError(
+            "GitHub Checks annotation pagination budget exhausted before completion"
+        )
+
     def get_job_logs(self, repo: str, job_id: int) -> str:
-        return str(self.request("GET", f"/repos/{repo}/actions/jobs/{job_id}/logs", accept="application/vnd.github+json"))
+        # Job logs are a text/archive response (and may redirect to GitHub's blob
+        # storage), not a JSON resource. Reading them through request() can
+        # stringify/transform the response path and hide the exact runner
+        # evidence the classifier needs. Preserve the response bytes verbatim
+        # and decode only after the safe redirect handler has removed auth on
+        # cross-host redirects.
+        raw = self.request_bytes(
+            "GET",
+            f"/repos/{repo}/actions/jobs/{job_id}/logs",
+            accept="application/vnd.github+json",
+        )
+        text = raw.decode("utf-8", errors="replace")
+        if _bool_env("CI_RETRY_GATE_LOG_DIAGNOSTICS", False):
+            lowered = text.lower()
+            print(
+                "::notice::job-log diagnostics "
+                f"job_id={job_id} bytes={len(raw)} chars={len(text)} "
+                f"has_shutdown_signal={'the runner has received a shutdown signal' in lowered} "
+                f"has_operation_canceled={'the operation was canceled' in lowered} "
+                f"starts_with={text[:80].replace(chr(10), ' ').replace(chr(13), ' ')!r}"
+            )
+        return text
 
     def rerun_failed_jobs(self, repo: str, run_id: int) -> None:
         self.request("POST", f"/repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs", payload={})
@@ -702,7 +1332,7 @@ def _write_output(name: str, value: str) -> None:
             handle.write(f"{name}={value}\n")
 
 
-def render_report(repo: str, run_id: int, run_attempt: int, assessments: list[JobAssessment], safe: bool, reason: str, rerun_triggered: bool) -> str:
+def render_report(repo: str, run_id: int, run_attempt: int, assessments: list[JobAssessment], safe: bool, reason: str, rerun_triggered: bool, recovered: dict[int, str] | None = None, historical: dict | None = None, recurrent: dict[int, str] | None = None, decision_experience: dict | None = None, effect_deferred: bool = False, mutation_admitted: bool = False) -> str:
     wasted = round(sum(item.duration_minutes for item in assessments), 2)
     lines = [
         "<!-- ci-retry-gate-report -->",
@@ -714,11 +1344,51 @@ def render_report(repo: str, run_id: int, run_attempt: int, assessments: list[Jo
         "",
         f"{reason}",
         "",
+    ]
+    if decision_experience:
+        lines.extend(render_decision_card(decision_experience).rstrip().splitlines())
+        lines.append("")
+    recovered = recovered or {}
+    if recovered:
+        lines.extend([
+            "### Recovery evidence",
+            "",
+            "The rerun decision below is based on explicit recovery metadata; failure-cause logs are a separate evidence channel.",
+            "",
+        ])
+        for item in assessments:
+            retry_name = recovered.get(item.job_id)
+            if retry_name:
+                lines.append(f"- `{item.name}` failed → explicit retry `{retry_name}` succeeded.")
+        lines.append("")
+    recurrent = recurrent or {}
+    if recurrent:
+        lines.extend(["### Recurrence evidence", "", "The next attempt repeated the same failed job identity; later eventual success does not erase this failed rerun.", ""])
+        for item in assessments:
+            later_name = recurrent.get(item.job_id)
+            if later_name:
+                lines.append(f"- `{item.name}` failed → next attempt `{later_name}` failed again.")
+        lines.append("")
+    historical = historical or {}
+    if historical:
+        lines.extend([
+            "### Historical reliability",
+            "",
+            f"- Status: `{historical.get('status', 'INSUFFICIENT_HISTORY')}`",
+            f"- Verified prior recoveries (job-level): **{historical.get('verified_prior_recoveries', 0)}**",
+            f"- Independent prior incidents: **{historical.get('verified_prior_incidents', 0)}**",
+            f"- Recoveries by job identity: `{json.dumps(historical.get('recoveries_by_identity', {}), sort_keys=True)}`",
+            f"- Latest verified recovery: `{historical.get('latest_verified_recovery_at') or 'none'}`",
+            f"- Evidence cutoff: `{historical.get('cutoff') or 'unknown'}`",
+            f"- Authorization: `{historical.get('authorization', 'NOT_AUTHORIZING')}`",
+            "",
+        ])
+    lines.extend([
         f"Failed-job runtime observed: **{wasted:.2f} min**",
         "",
         "| Job | Classification | Confidence | Retry provenance | Outcome step | Side-effect risk | Runtime |",
         "|---|---|---|---|---|---|---:|",
-    ]
+    ])
     for item in assessments:
         lines.append(
             f"| {item.name.replace('|', '/')} | `{item.category}` | {item.confidence} | "
@@ -745,8 +1415,266 @@ def render_report(repo: str, run_id: int, run_attempt: int, assessments: list[Jo
             lines.append("Side-effect signals:")
             for evidence in item.side_effect_evidence:
                 lines.append(f"- `{evidence.replace('`', "'")}`")
-    lines.extend(["", f"Automatic rerun triggered: **{'yes' if rerun_triggered else 'no'}**"])
+    if effect_deferred and mutation_admitted:
+        lines.extend([
+            "",
+            "Automatic rerun: **pending durable audit upload and effect revalidation**",
+        ])
+    else:
+        lines.extend(["", f"Automatic rerun triggered: **{'yes' if rerun_triggered else 'no'}**"])
     return "\n".join(lines) + "\n"
+
+
+def assess_failed_jobs(api: "GitHubAPI", repo: str, failed_jobs: Iterable[dict]) -> list[JobAssessment]:
+    """Assess failed jobs and fail closed when log evidence cannot be acquired."""
+    assessments: list[JobAssessment] = []
+    for job in failed_jobs:
+        job_id = int(job.get("id") or 0)
+        try:
+            logs = api.get_job_logs(repo, job_id)
+        except RuntimeError as exc:
+            # A runner can die before its log blob is finalized. In that narrow
+            # case GitHub may still retain a failure annotation on the Actions
+            # check run. Installed mode uses authenticated Checks access.
+            # Public-read-only mode may use the same exact-bound GitHub check
+            # metadata without forwarding credentials into the target repository.
+            error_text = redact(str(exc))
+            public_read_only = _bool_env("INPUT_PUBLIC_READ_ONLY", False)
+            annotation_note = "Check annotation fallback was not available."
+            check_run_id = _check_run_id_from_job(job)
+            api_token = str(getattr(api, "token", "") or "")
+            annotation_access_allowed = bool(api_token) or public_read_only
+            if annotation_access_allowed and check_run_id is not None:
+                source = "authenticated" if api_token else "public"
+                try:
+                    check_run = api.get_check_run(repo, check_run_id)
+                    annotations = api.get_check_run_annotations(repo, check_run_id)
+                except RuntimeError as annotation_exc:
+                    annotation_note = (
+                        f"{source.capitalize()} check annotation acquisition failed: "
+                        f"{redact(str(annotation_exc))}"
+                    )
+                else:
+                    if api_token:
+                        annotation_assessment = assess_authenticated_runner_annotations(
+                            job,
+                            check_run,
+                            annotations,
+                        )
+                    else:
+                        annotation_assessment = assess_public_runner_annotations(
+                            job,
+                            check_run,
+                            annotations,
+                        )
+                    if annotation_assessment is not None:
+                        if _bool_env("CI_RETRY_GATE_LOG_DIAGNOSTICS", False):
+                            print(
+                                f"::notice::using {source} check annotation fallback "
+                                f"job_id={job_id} check_run_id={check_run_id}"
+                            )
+                        assessments.append(annotation_assessment)
+                        continue
+                    annotation_note = (
+                        f"{source.capitalize()} check annotations contained no eligible "
+                        "job-bound runner-loss signal."
+                    )
+            elif check_run_id is None:
+                annotation_note = (
+                    "Workflow job metadata did not contain a valid check_run_url."
+                )
+            elif not api_token:
+                annotation_note = (
+                    "Authenticated check annotation fallback requires a GitHub token "
+                    "outside public-read-only mode."
+                )
+
+            # Evidence acquisition failure is not an ordinary UNKNOWN
+            # classification. Keep it explicit so downstream authorization can
+            # distinguish "log inspected, no signature found" from "the log
+            # could not be inspected at all".
+            if _bool_env("CI_RETRY_GATE_LOG_DIAGNOSTICS", False):
+                print(
+                    "::warning::job-log acquisition failed "
+                    f"job_id={job_id} error={error_text}"
+                )
+            failure_step = assess_failure_step_provenance(job)
+            side_effect_risk, side_effect_evidence = detect_side_effect_risk(job)
+            assessments.append(
+                JobAssessment(
+                    job_id=job_id,
+                    name=str(job.get("name") or f"job-{job_id}"),
+                    category="EVIDENCE_UNAVAILABLE",
+                    confidence="none",
+                    evidence=(
+                        f"Job log acquisition failed: {error_text}",
+                        annotation_note,
+                    ),
+                    provenance_status=PROVENANCE_UNAVAILABLE,
+                    provenance_step="",
+                    provenance_command="",
+                    provenance_evidence=("Execution evidence was unavailable.",),
+                    failure_step_status=failure_step.status,
+                    failure_step=failure_step.step_name,
+                    failure_step_evidence=failure_step.evidence,
+                    side_effect_risk=side_effect_risk,
+                    side_effect_evidence=side_effect_evidence,
+                    duration_minutes=job_duration_minutes(job),
+                )
+            )
+            continue
+        assessments.append(assess_job(job, logs))
+
+    return assessments
+
+
+def _state_binding_token(value: object) -> str:
+    """Canonicalize one domain value into a non-empty opaque EASL token."""
+    return "json:" + json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
+def _failed_job_binding_value(jobs: Iterable[dict]) -> list[list[object]]:
+    return sorted(
+        [
+            [
+                int(job.get("id") or 0),
+                str(job.get("conclusion") or "").lower(),
+            ]
+            for job in jobs
+            if str(job.get("conclusion") or "").lower() in FAILURE_CONCLUSIONS
+        ],
+        key=lambda item: (int(item[0]), str(item[1])),
+    )
+
+
+def _changed_binding_reason(
+    invalidation_ids: Iterable[str],
+    details: dict[str, str],
+) -> str | None:
+    changed = [details[binding_id] for binding_id in invalidation_ids if binding_id in details]
+    if not changed:
+        return None
+    return "RERUN_SCOPE_CHANGED: " + "; ".join(changed) + "."
+
+
+def revalidate_rerun_subject_binding(
+    api: "GitHubAPI",
+    repo: str,
+    run_id: int,
+    evidence_decision: dict,
+    expected_failed_jobs: Iterable[dict],
+) -> tuple[bool, str]:
+    """Re-read the target run and evaluate its subject state with EASL semantics."""
+    scope = evidence_decision.get("scope")
+    if not isinstance(scope, dict):
+        return False, "RERUN_SCOPE_INVALID: evidence decision has no valid scope."
+
+    expected_repository = str(scope.get("repository") or "")
+    try:
+        expected_run_id = int(scope.get("run_id"))
+        expected_attempt = int(scope.get("run_attempt"))
+    except (TypeError, ValueError):
+        return False, "RERUN_SCOPE_INVALID: run_id/run_attempt binding is missing or invalid."
+
+    static_bindings = (
+        StateBinding(
+            id="repository",
+            expected=_state_binding_token(expected_repository),
+            observed=_state_binding_token(repo),
+        ),
+        StateBinding(
+            id="run-id",
+            expected=_state_binding_token(expected_run_id),
+            observed=_state_binding_token(run_id),
+        ),
+    )
+    static_details = {
+        "repository": f"repository {expected_repository!r}->{repo!r}",
+        "run-id": f"run_id {expected_run_id}->{run_id}",
+    }
+    try:
+        static_invalidations = evaluate_required_state_bindings(
+            static_bindings,
+            ("repository", "run-id"),
+        )
+    except StateBindingError as exc:
+        return False, f"RERUN_SCOPE_INVALID: {exc}."
+
+    static_reason = _changed_binding_reason(
+        (item.state_binding_id for item in static_invalidations),
+        static_details,
+    )
+    if static_reason is not None:
+        return False, static_reason
+
+    current_run = api.get_run(repo, run_id)
+    current_attempt = int(current_run.get("run_attempt") or 0)
+    current_head_sha = str(current_run.get("head_sha") or "")
+    current_workflow_id = current_run.get("workflow_id")
+
+    expected_head_sha = str(scope.get("head_sha") or "")
+    expected_workflow_id = scope.get("workflow_id")
+
+    current_jobs = api.get_jobs(repo, run_id)
+    expected_failed = _failed_job_binding_value(expected_failed_jobs)
+    current_failed = _failed_job_binding_value(current_jobs)
+
+    dynamic_bindings = (
+        StateBinding(
+            id="run-attempt",
+            expected=_state_binding_token(expected_attempt),
+            observed=_state_binding_token(current_attempt),
+        ),
+        StateBinding(
+            id="head-sha",
+            expected=_state_binding_token(expected_head_sha),
+            observed=_state_binding_token(current_head_sha),
+        ),
+        StateBinding(
+            id="workflow-id",
+            expected=_state_binding_token(expected_workflow_id),
+            observed=_state_binding_token(current_workflow_id),
+        ),
+        StateBinding(
+            id="failed-job-set",
+            expected=_state_binding_token(expected_failed),
+            observed=_state_binding_token(current_failed),
+        ),
+    )
+    dynamic_details = {
+        "run-attempt": f"run_attempt {expected_attempt}->{current_attempt}",
+        "head-sha": f"head_sha {expected_head_sha!r}->{current_head_sha!r}",
+        "workflow-id": (
+            f"workflow_id {expected_workflow_id!r}->{current_workflow_id!r}"
+        ),
+        "failed-job-set": (
+            f"failed_job_set {expected_failed!r}->{current_failed!r}"
+        ),
+    }
+    try:
+        dynamic_invalidations = evaluate_required_state_bindings(
+            dynamic_bindings,
+            ("run-attempt", "head-sha", "workflow-id", "failed-job-set"),
+        )
+    except StateBindingError as exc:
+        return False, f"RERUN_SCOPE_INVALID: {exc}."
+
+    dynamic_reason = _changed_binding_reason(
+        (item.state_binding_id for item in dynamic_invalidations),
+        dynamic_details,
+    )
+    if dynamic_reason is not None:
+        return False, dynamic_reason
+
+    return True, (
+        "RERUN_SCOPE_CONFIRMED: repository, run attempt, head SHA, workflow, "
+        "and failed-job set still match the evidence decision."
+    )
 
 
 def main() -> int:
@@ -756,8 +1684,9 @@ def main() -> int:
     workflow_run = event.get("workflow_run") or {}
     run_id_raw = os.environ.get("INPUT_RUN_ID") or workflow_run.get("id") or os.environ.get("GITHUB_RUN_ID")
 
-    if not token:
-        print("::error::github-token is required")
+    public_read_only = _bool_env("INPUT_PUBLIC_READ_ONLY", False)
+    if not token and not public_read_only:
+        print("::error::github-token is required unless public-read-only mode is enabled")
         return 2
     if not repo:
         print("::error::repository could not be determined")
@@ -770,36 +1699,422 @@ def main() -> int:
 
     max_attempts = int(os.environ.get("INPUT_MAX_ATTEMPTS", "2"))
     auto_rerun = _bool_env("INPUT_AUTO_RERUN", False)
-    comment_on_pr = _bool_env("INPUT_COMMENT_ON_PR", True)
+    defer_effect = _bool_env("INPUT_DEFER_EFFECT", False)
+    comment_on_pr = _bool_env("INPUT_COMMENT_ON_PR", False)
+    if public_read_only and (auto_rerun or comment_on_pr):
+        print("::error::public-read-only mode cannot rerun jobs or post into the target repository")
+        return 2
+    run_attempt_raw = (os.environ.get("INPUT_RUN_ATTEMPT") or "").strip()
+    selected_run_attempt: int | None = None
+    if run_attempt_raw:
+        try:
+            selected_run_attempt = int(run_attempt_raw)
+        except ValueError:
+            print("::error::run-attempt must be a positive integer")
+            return 2
+        if selected_run_attempt < 1:
+            print("::error::run-attempt must be a positive integer")
+            return 2
+        if auto_rerun:
+            print("::error::run-attempt is read-only and cannot be combined with auto-rerun")
+            return 2
 
-    api = GitHubAPI(token, os.environ.get("GITHUB_API_URL", "https://api.github.com"))
-    run = api.get_run(repo, run_id)
-    run_attempt = int(run.get("run_attempt") or 1)
-    jobs = api.get_jobs(repo, run_id)
+    # Public proof deliberately avoids forwarding the workflow's installation token to
+    # another repository. GitHub's public Actions read endpoints support unauthenticated
+    # access, so the proof surface needs no target-repository installation or permission.
+    api = GitHubAPI("" if public_read_only else str(token), os.environ.get("GITHUB_API_URL", "https://api.github.com"))
+    if public_read_only:
+        repository = api.get_repository(repo)
+        if bool(repository.get("private", True)):
+            print("::error::public-read-only mode only supports public repositories")
+            return 2
+
+    if selected_run_attempt is None:
+        run = api.get_run(repo, run_id)
+        run_attempt = int(run.get("run_attempt") or 1)
+        jobs = api.get_jobs(repo, run_id)
+    else:
+        run = api.get_run_attempt(repo, run_id, selected_run_attempt)
+        run_attempt = selected_run_attempt
+        jobs = api.get_jobs_attempt(repo, run_id, selected_run_attempt)
+
+    # Audit history is observation-only. Failure to discover, download, verify,
+    # or bind a prior DER never grants or removes current retry authority.
+    prior_decision: dict | None = None
+    prior_execution_receipt: dict | None = None
+    prior_parent_ref: dict | None = None
+    prior_jobs: list[dict] | None = None
+    prior_history_note = ""
+
+    if selected_run_attempt is None and run_attempt > 1:
+        try:
+            prior_artifact = find_previous_decision_artifact(
+                api,
+                repo,
+                run_id=run_id,
+                current_attempt=run_attempt,
+            )
+        except (DecisionHistoryError, RuntimeError) as exc:
+            prior_history_note = f"PRIOR_AUDIT_UNAVAILABLE: {redact(str(exc))}"
+        else:
+            if prior_artifact is None:
+                prior_history_note = "PRIOR_AUDIT_NOT_FOUND"
+            else:
+                try:
+                    prior_trail = download_prior_audit_trail(
+                        api,
+                        repo,
+                        prior_artifact,
+                    )
+                    bound, binding_reason = bind_parent_decision_to_attempt(
+                        parent_decision=prior_trail.decision_record,
+                        repository=repo,
+                        run_id=run_id,
+                        current_run=run,
+                        current_attempt=run_attempt,
+                    )
+                except (DecisionHistoryError, RuntimeError, ValueError) as exc:
+                    prior_history_note = f"PRIOR_AUDIT_UNTRUSTED: {redact(str(exc))}"
+                else:
+                    if not bound:
+                        prior_history_note = binding_reason
+                    else:
+                        prior_decision = prior_trail.decision_record
+                        prior_execution_receipt = prior_trail.execution_receipt
+                        prior_parent_ref = decision_parent_ref(prior_decision)
+                        try:
+                            prior_jobs = api.get_jobs_attempt(
+                                repo,
+                                run_id,
+                                run_attempt - 1,
+                            )
+                        except RuntimeError as exc:
+                            prior_history_note = (
+                                "PRIOR_ATTEMPT_JOBS_UNAVAILABLE: "
+                                + redact(str(exc))
+                            )
+                        else:
+                            prior_history_note = "PRIOR_AUDIT_BOUND"
+
+    if prior_history_note:
+        print(f"::notice::audit-history {prior_history_note}")
+
     failed_jobs = [job for job in jobs if str(job.get("conclusion") or "").lower() in FAILURE_CONCLUSIONS]
 
-    assessments: list[JobAssessment] = []
-    for job in failed_jobs:
-        job_id = int(job.get("id") or 0)
-        try:
-            logs = api.get_job_logs(repo, job_id)
-        except RuntimeError as exc:
-            logs = f"Unable to fetch logs: {exc}"
-        assessments.append(assess_job(job, logs))
+    assessments = assess_failed_jobs(api, repo, failed_jobs)
+    evidence_bundle = produce_ci_evidence_bundle(
+        repo=repo,
+        run=run,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        assessments=assessments,
+    )
+    evidence_path = _evidence_artifact_path(repo, run_id, run_attempt)
+    evidence_sha256 = write_evidence_artifact(evidence_path, evidence_bundle)
 
-    safe, reason = rerun_decision(assessments, run_attempt, max_attempts)
-    rerun_triggered = False
+    outcome_record_path: Path | None = None
+    reconciliation_record_path: Path | None = None
+    reconciliation_status = ""
+    if prior_decision is not None and prior_jobs is not None:
+        outcome_record = seal_audit_record(
+            build_outcome_record(
+                parent_decision=prior_decision,
+                current_run=run,
+                previous_jobs=prior_jobs,
+                current_jobs=jobs,
+                execution_receipt=prior_execution_receipt,
+            )
+        )
+        outcome_record_path = _outcome_record_path(evidence_path)
+        write_outcome_record(outcome_record_path, outcome_record)
+
+        reconciliation_record = seal_audit_record(
+            build_reconciliation_record(
+                parent_decision=prior_decision,
+                outcome_record=outcome_record,
+            )
+        )
+        reconciliation_record_path = _reconciliation_record_path(evidence_path)
+        write_reconciliation_record(
+            reconciliation_record_path,
+            reconciliation_record,
+        )
+        reconciliation_status = str(reconciliation_record["status"])
+        print(
+            "::notice::previous-decision-reconciliation "
+            f"status={reconciliation_status} "
+            f"parent_event_id={prior_decision['event_id']}"
+        )
+
+    evidence_decision = _run_evidence_gate_process(
+        evidence_path,
+        evidence_sha256,
+        max_attempts,
+    )
+    safe = evidence_decision["decision"] == "ALLOW"
+    reason = str(evidence_decision["reasons"][0])
+
+    action_request = build_ci_action_request(
+        repository=repo,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        head_sha=str(run.get("head_sha") or ""),
+        workflow_id=run.get("workflow_id"),
+    )
+    contract_timestamp = str(action_request["created_at"])
+    assumption_state = build_ci_retry_assumption_state(
+        action_request=action_request,
+        evidence_decision=evidence_decision,
+        evidence_sha256=evidence_sha256,
+        created_at=contract_timestamp,
+    )
+    authority_grant = build_ci_authority_grant(
+        action_request=action_request,
+        created_at=contract_timestamp,
+    )
+    contract_decision = build_decision_artifact(
+        action_request=action_request,
+        evidence_decision=evidence_decision,
+        evidence_sha256=evidence_sha256,
+        assumption_states=[assumption_state],
+        authority_grant=authority_grant,
+        require_authority=True,
+        created_at=contract_timestamp,
+    )
+
+    recovered = detect_recovered_failures(failed_jobs, jobs)
+    recurrent: dict[int, str] = {}
+    recovery_scope = "same attempt"
+    if failed_jobs and len(recovered) != len(failed_jobs) and selected_run_attempt is not None:
+        latest_run = api.get_run(repo, run_id)
+        latest_attempt = int(latest_run.get("run_attempt") or selected_run_attempt)
+        if latest_attempt > selected_run_attempt:
+            later_jobs = api.get_jobs_attempt(repo, run_id, selected_run_attempt + 1)
+            recovered = detect_cross_attempt_recovery(failed_jobs, later_jobs)
+            recurrent = detect_cross_attempt_recurrence(failed_jobs, later_jobs)
+            recovery_scope = f"attempt {selected_run_attempt + 1}"
+
+    # Conservative outer guards may only narrow the isolated gate's ALLOW.
+    outer_guard_applied = False
+    if failed_jobs and len(recovered) == len(failed_jobs):
+        outer_guard_applied = True
+        pairs = "; ".join(
+            f"{str(job.get('name') or job.get('id'))} -> {recovered[int(job.get('id') or 0)]}"
+            for job in failed_jobs
+        )
+        safe = False
+        reason = (
+            "FAILURE_RECOVERED: every failed job has an explicit successful retry "
+            f"counterpart in {recovery_scope} ({pairs}). Another automatic rerun is not justified."
+        )
+    elif recurrent:
+        outer_guard_applied = True
+        pairs = "; ".join(
+            f"{str(job.get('name') or job.get('id'))} -> {recurrent[int(job.get('id') or 0)]}"
+            for job in failed_jobs if int(job.get("id") or 0) in recurrent
+        )
+        safe = False
+        reason = (
+            "NEXT_ATTEMPT_RECURRENCE: the same failed job identity failed again in "
+            f"{recovery_scope} ({pairs}). A successful later attempt must not erase this recurrence."
+        )
+
+    if outer_guard_applied:
+        evidence_decision["decision"] = "BLOCK"
+        evidence_decision["reasons"] = [reason]
+        if evidence_decision.get("contradictions"):
+            evidence_decision["evidence_status"] = "CONTRADICTED"
+            evidence_decision["confidence"] = "high"
+        else:
+            evidence_decision["evidence_status"] = "UNKNOWN"
+            evidence_decision["confidence"] = "unknown"
+
+    execution_time: str | None = None
+    mutation_admitted = False
+
     if safe and auto_rerun:
+        try:
+            binding_valid, binding_reason = revalidate_rerun_subject_binding(
+                api,
+                repo,
+                run_id,
+                evidence_decision,
+                failed_jobs,
+            )
+        except RuntimeError as exc:
+            binding_valid = False
+            binding_reason = (
+                "RERUN_SCOPE_UNAVAILABLE: could not re-read current workflow state "
+                f"before rerun: {redact(str(exc))}"
+            )
+
+        if not binding_valid:
+            safe = False
+            reason = binding_reason
+            evidence_decision["decision"] = "BLOCK"
+            evidence_decision["reasons"] = [reason]
+            evidence_decision["evidence_status"] = "UNKNOWN"
+            evidence_decision["confidence"] = "unknown"
+        else:
+            execution_time = (
+                datetime.now(timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
+
+            # Rebuild the exact contract after all narrowing guards and before
+            # the effect boundary. This is the Decision checked at mutation time.
+            contract_decision = build_decision_artifact(
+                action_request=action_request,
+                evidence_decision=evidence_decision,
+                evidence_sha256=evidence_sha256,
+                assumption_states=[assumption_state],
+                authority_grant=authority_grant,
+                require_authority=True,
+                created_at=contract_timestamp,
+            )
+            try:
+                ensure_decision_allows_request(
+                    contract_decision,
+                    action_request,
+                    now=execution_time,
+                    assumption_states=[assumption_state],
+                    authority_grant=authority_grant,
+                )
+            except ContractViolation as exc:
+                safe = False
+                reason = f"INTEGRATION_CONTRACT_BLOCK: {exc}."
+                evidence_decision["decision"] = "BLOCK"
+                evidence_decision["reasons"] = [reason]
+                evidence_decision["evidence_status"] = "UNKNOWN"
+                evidence_decision["confidence"] = "unknown"
+            else:
+                mutation_admitted = True
+
+    # The Decision Evidence Record is immutable T1 audit evidence. Persist it
+    # after all decision-narrowing checks and before an optional mutation.
+    pre_effect_experience = build_decision_experience(
+        evidence_decision=evidence_decision,
+        assessments=assessments,
+        rerun_triggered=False,
+        run_attempt=run_attempt,
+        max_attempts=max_attempts,
+    )
+    decision_record = build_decision_record(
+        evidence_decision=evidence_decision,
+        evidence_bundle_sha256=evidence_sha256,
+        policy_ref=PRODUCTION_POLICY_REF,
+        authorization_path="POLICY",
+        next_action=str(pre_effect_experience["next_action"]),
+        identities=collect_decision_identities(
+            run,
+            rerun_will_be_requested=bool(mutation_admitted),
+        ),
+        parent_decision=prior_parent_ref,
+    )
+    decision_record_path = _decision_record_path(evidence_path)
+    decision_record_sha256 = write_decision_record(
+        decision_record_path,
+        decision_record,
+    )
+    decision_record_artifact_name = (
+        f"ci-retry-gate-der-{run_id}-attempt-{run_attempt}-"
+        f"{decision_record_sha256}"
+    )
+
+    effect_plan = build_effect_plan(
+        mutation_admitted=bool(mutation_admitted),
+        repository=repo,
+        run_id=run_id,
+        evidence_decision=evidence_decision,
+        failed_jobs=failed_jobs,
+        decision_record_sha256=decision_record_sha256,
+    )
+    effect_plan_path = _effect_plan_path(evidence_path)
+    effect_plan_sha256 = write_effect_plan(effect_plan_path, effect_plan)
+
+    rerun_triggered = False
+    if mutation_admitted and not defer_effect:
         api.rerun_failed_jobs(repo, run_id)
         rerun_triggered = True
 
-    report = render_report(repo, run_id, run_attempt, assessments, safe, reason, rerun_triggered)
+    evidence_decision["rerun_triggered"] = rerun_triggered
+
+    # This public EBA decision is identical to the decision admitted at the
+    # boundary. BLOCK/report-only paths are rebuilt from the same final state.
+    contract_decision = build_decision_artifact(
+        action_request=action_request,
+        evidence_decision=evidence_decision,
+        evidence_sha256=evidence_sha256,
+        assumption_states=[assumption_state],
+        authority_grant=authority_grant,
+        require_authority=True,
+        created_at=contract_timestamp,
+    )
+    execution_receipt = build_execution_receipt(
+        action_request=action_request,
+        decision_artifact=contract_decision,
+        assumption_states=[assumption_state],
+        authority_grant=authority_grant,
+        rerun_triggered=rerun_triggered,
+        admitted_at=execution_time,
+    )
+
+    historical = collect_historical_reliability(api, repo, run, failed_jobs)
+
+    request_path = evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".eba-request.json")
+    )
+    assumption_path = evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".eba-assumption.json")
+    )
+    authority_path = evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".eba-authority.json")
+    )
+    decision_path = evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".eba-decision.json")
+    )
+    receipt_path = evidence_path.with_name(
+        evidence_path.name.replace(".evidence.json", ".eba-receipt.json")
+    )
+    request_sha256 = write_contract_artifact(request_path, action_request)
+    assumption_sha256 = write_contract_artifact(assumption_path, assumption_state)
+    authority_sha256 = write_contract_artifact(authority_path, authority_grant)
+    decision_sha256 = write_contract_artifact(decision_path, contract_decision)
+    receipt_sha256 = write_contract_artifact(receipt_path, execution_receipt)
+
+    decision_experience = build_decision_experience(
+        evidence_decision=evidence_decision,
+        assessments=assessments,
+        rerun_triggered=rerun_triggered,
+        run_attempt=run_attempt,
+        max_attempts=max_attempts,
+    )
+    report = render_report(
+        repo,
+        run_id,
+        run_attempt,
+        assessments,
+        safe,
+        reason,
+        rerun_triggered,
+        recovered,
+        historical,
+        recurrent,
+        decision_experience,
+        effect_deferred=defer_effect,
+        mutation_admitted=mutation_admitted,
+    )
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as handle:
             handle.write(report)
     else:
         print(report)
+
+    report_file = (os.environ.get("CI_RETRY_GATE_REPORT_FILE") or "").strip()
+    if report_file:
+        Path(report_file).write_text(report, encoding="utf-8")
 
     prs = workflow_run.get("pull_requests") or []
     if comment_on_pr and prs:
@@ -810,6 +2125,99 @@ def main() -> int:
             except RuntimeError as exc:
                 print(f"::warning::Could not post PR comment: {exc}")
 
+    _write_output("decision", str(evidence_decision["decision"]))
+    _write_output("evidence-status", str(evidence_decision["evidence_status"]))
+    _write_output("reason", reason)
+    _write_output(
+        "decision-experience-json",
+        json.dumps(decision_experience, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output("next-action", str(decision_experience["next_action"]))
+    _write_output(
+        "observed-failed-minutes",
+        f"{float(decision_experience['minutes']['observed_failed']):.2f}",
+    )
+    _write_output(
+        "rerun-eligible-jobs",
+        str(decision_experience["jobs"]["rerun_eligible"]),
+    )
+    _write_output(
+        "rerun-blocked-jobs",
+        str(decision_experience["jobs"]["rerun_blocked"]),
+    )
+    _write_output(
+        "side-effect-blocked-jobs",
+        str(decision_experience["jobs"]["side_effect_blocked"]),
+    )
+    _write_output(
+        "evidence-unavailable-jobs",
+        str(decision_experience["jobs"]["evidence_unavailable"]),
+    )
+    _write_output(
+        "eligible-failed-minutes",
+        f"{float(decision_experience['minutes']['rerun_eligible_failed']):.2f}",
+    )
+    _write_output(
+        "blocked-failed-minutes",
+        f"{float(decision_experience['minutes']['rerun_blocked_failed']):.2f}",
+    )
+    _write_output(
+        "failed-jobs-json",
+        json.dumps(evidence_decision["failed_jobs"], separators=(",", ":"), sort_keys=True),
+    )
+    _write_output(
+        "evidence-json",
+        json.dumps(evidence_decision, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output("evidence-bundle-path", str(evidence_path))
+    _write_output("evidence-bundle-sha256", evidence_sha256)
+    _write_output("decision-record-path", str(decision_record_path))
+    _write_output("decision-record-sha256", decision_record_sha256)
+    _write_output("decision-event-id", str(decision_record["event_id"]))
+    _write_output("authorization-path", str(decision_record["authorization_path"]))
+    _write_output("decision-record-artifact-name", decision_record_artifact_name)
+    _write_output("mutation-admitted", "true" if mutation_admitted else "false")
+    _write_output("effect-plan-path", str(effect_plan_path))
+    _write_output("effect-plan-sha256", effect_plan_sha256)
+    _write_output("eba-request-path", str(request_path))
+    _write_output("eba-assumption-path", str(assumption_path))
+    _write_output("eba-authority-path", str(authority_path))
+    _write_output("eba-decision-path", str(decision_path))
+    _write_output("eba-receipt-path", str(receipt_path))
+    _write_output(
+        "outcome-record-path",
+        str(outcome_record_path) if outcome_record_path is not None else "",
+    )
+    _write_output(
+        "reconciliation-record-path",
+        str(reconciliation_record_path) if reconciliation_record_path is not None else "",
+    )
+    _write_output("previous-reconciliation-status", reconciliation_status)
+    _write_output(
+        "eba-request-json",
+        json.dumps(action_request, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output("eba-request-sha256", request_sha256)
+    _write_output(
+        "eba-assumption-json",
+        json.dumps(assumption_state, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output("eba-assumption-sha256", assumption_sha256)
+    _write_output(
+        "eba-authority-json",
+        json.dumps(authority_grant, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output("eba-authority-sha256", authority_sha256)
+    _write_output(
+        "eba-decision-json",
+        json.dumps(contract_decision, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output("eba-decision-sha256", decision_sha256)
+    _write_output(
+        "eba-receipt-json",
+        json.dumps(execution_receipt, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output("eba-receipt-sha256", receipt_sha256)
     _write_output("safe-to-rerun", "true" if safe else "false")
     _write_output("rerun-triggered", "true" if rerun_triggered else "false")
     _write_output("failed-jobs", str(len(assessments)))

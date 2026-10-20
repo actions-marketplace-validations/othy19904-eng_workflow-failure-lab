@@ -7,6 +7,7 @@ from setup_doctor import (
     PASS,
     WARN,
     _safe_workdir,
+    build_activation_workflow_yaml,
     build_recommended_yaml,
     detect_frameworks,
     inspect_setup,
@@ -16,14 +17,19 @@ from setup_doctor import (
 
 
 class FakeAPI:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, fail_checks=False):
         self.fail = fail
+        self.fail_checks = fail_checks
         self.calls = []
 
     def request(self, method, path, payload=None, accept="application/vnd.github+json"):
         self.calls.append((method, path))
         if self.fail:
             raise RuntimeError("GitHub API GET failed with HTTP 403: forbidden")
+        if "/check-runs?" in path:
+            if self.fail_checks:
+                raise RuntimeError("GitHub Checks API failed with HTTP 403: forbidden")
+            return {"check_runs": []}
         if path.endswith("/actions/runs?per_page=1"):
             return {"workflow_runs": []}
         return {"full_name": "o/r"}
@@ -102,6 +108,7 @@ def test_ready_baseline_passes_with_read_only_api(tmp_path):
     assert statuses["Jest JUnit reporter"] == PASS
     assert statuses["JUnit artifact wiring"] == PASS
     assert statuses["GitHub API read access"] == PASS
+    assert statuses["GitHub Checks read access"] == PASS
 
 
 def test_jest_without_junit_reporter_is_blocked(tmp_path):
@@ -259,6 +266,7 @@ def test_write_permissions_are_recommended_but_not_probed(tmp_path):
     assert permissions == (
         "contents: read",
         "actions: write",
+        "checks: read",
         "pull-requests: write",
         "issues: write",
     )
@@ -302,6 +310,32 @@ def test_api_read_failure_blocks_setup(tmp_path):
 
     assert not report.ready
     assert status_map(report)["GitHub API read access"] == BLOCKED
+    assert status_map(report)["GitHub Checks read access"] == WARN
+
+
+def test_missing_checks_permission_warns_without_blocking_setup(tmp_path):
+    root = baseline_repo(tmp_path)
+    report = inspect_setup(
+        root,
+        requested_frameworks="pytest",
+        junit_prefix="junit-results",
+        ownership_routing=False,
+        ownership_map=".github/flaky-ownership.json",
+        quarantine_lifecycle=False,
+        quarantine_manifest=".github/flaky-quarantine.json",
+        quarantine_max_days=14,
+        triage_comment=False,
+        issue_lifecycle=False,
+        rerun_mode="none",
+        api=FakeAPI(fail_checks=True),
+        repo="o/r",
+    )
+
+    statuses = status_map(report)
+    assert report.ready
+    assert statuses["GitHub API read access"] == PASS
+    assert statuses["GitHub Checks read access"] == WARN
+    assert "checks: read" in report.required_permissions
 
 
 def test_recommended_yaml_matches_requested_features():
@@ -309,6 +343,7 @@ def test_recommended_yaml_matches_requested_features():
         permissions=(
             "contents: read",
             "actions: write",
+            "checks: read",
             "pull-requests: write",
             "issues: write",
         ),
@@ -329,7 +364,72 @@ def test_recommended_yaml_matches_requested_features():
     assert "quarantine-lifecycle: 'true'" in text
     assert "flaky-triage-comment: 'true'" in text
     assert "flaky-issue-lifecycle: 'true'" in text
+    assert "achirothmane/workflow-failure-lab@v1" in text
+    assert "othy19904-eng/workflow-failure-lab@v1" not in text
     assert "actions: write" in text
+    assert "checks: read" in text
+
+
+def test_activation_workflow_is_copy_ready_and_read_only_by_default():
+    text = build_activation_workflow_yaml(
+        source_workflow="CI",
+        permissions=("contents: read", "actions: read", "checks: read"),
+        frameworks=("pytest",),
+        junit_prefix="junit-results",
+        ownership_routing=False,
+        ownership_map=".github/flaky-ownership.json",
+        quarantine_lifecycle=False,
+        quarantine_manifest=".github/flaky-quarantine.json",
+        triage_comment=False,
+        issue_lifecycle=False,
+        rerun_mode="none",
+    )
+
+    assert "name: CI Retry Gate" in text
+    assert 'workflows: ["CI"]' in text
+    assert "actions: read" in text
+    assert "auto-rerun: 'false'" in text
+    assert "selective-rerun: 'false'" in text
+    assert "flaky-test-intelligence: 'true'" in text
+    assert "achirothmane/workflow-failure-lab@v1" in text
+
+
+def test_activation_workflow_selective_mode_is_explicit():
+    text = build_activation_workflow_yaml(
+        source_workflow="Build & Test",
+        permissions=("contents: read", "actions: write", "checks: read"),
+        frameworks=(),
+        junit_prefix="junit-results",
+        ownership_routing=False,
+        ownership_map=".github/flaky-ownership.json",
+        quarantine_lifecycle=False,
+        quarantine_manifest=".github/flaky-quarantine.json",
+        triage_comment=False,
+        issue_lifecycle=False,
+        rerun_mode="selective",
+    )
+
+    assert 'workflows: ["Build & Test"]' in text
+    assert "actions: write" in text
+    assert "auto-rerun: 'false'" in text
+    assert "selective-rerun: 'true'" in text
+
+
+def test_activation_workflow_rejects_multiline_source_name():
+    with pytest.raises(ValueError):
+        build_activation_workflow_yaml(
+            source_workflow="CI\nInjected",
+            permissions=("contents: read", "actions: read", "checks: read"),
+            frameworks=(),
+            junit_prefix="junit-results",
+            ownership_routing=False,
+            ownership_map=".github/flaky-ownership.json",
+            quarantine_lifecycle=False,
+            quarantine_manifest=".github/flaky-quarantine.json",
+            triage_comment=False,
+            issue_lifecycle=False,
+            rerun_mode="none",
+        )
 
 
 def test_working_directory_cannot_escape_workspace(tmp_path):
@@ -342,3 +442,41 @@ def test_working_directory_cannot_escape_workspace(tmp_path):
 
     with pytest.raises(ValueError):
         _safe_workdir(workspace, "../outside")
+
+
+def test_checks_read_status_is_explicit_in_report(tmp_path):
+    root = baseline_repo(tmp_path)
+
+    passing = inspect_setup(
+        root,
+        requested_frameworks="pytest",
+        junit_prefix="junit-results",
+        ownership_routing=False,
+        ownership_map=".github/flaky-ownership.json",
+        quarantine_lifecycle=False,
+        quarantine_manifest=".github/flaky-quarantine.json",
+        quarantine_max_days=14,
+        triage_comment=False,
+        issue_lifecycle=False,
+        rerun_mode="none",
+        api=FakeAPI(),
+        repo="o/r",
+    )
+    warned = inspect_setup(
+        root,
+        requested_frameworks="pytest",
+        junit_prefix="junit-results",
+        ownership_routing=False,
+        ownership_map=".github/flaky-ownership.json",
+        quarantine_lifecycle=False,
+        quarantine_manifest=".github/flaky-quarantine.json",
+        quarantine_max_days=14,
+        triage_comment=False,
+        issue_lifecycle=False,
+        rerun_mode="none",
+        api=FakeAPI(fail_checks=True),
+        repo="o/r",
+    )
+
+    assert status_map(passing)["GitHub Checks read access"] == PASS
+    assert status_map(warned)["GitHub Checks read access"] == WARN

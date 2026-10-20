@@ -1,7 +1,10 @@
 import http.client
+from pathlib import Path
 
 import ci_retry_gate
-from ci_retry_gate import AMBIGUOUS, CAUSAL, FAILURE_STEP_AMBIGUOUS, FAILURE_STEP_CONFIRMED, NON_CAUSAL, PROVENANCE_CONFIRMED, PROVENANCE_MISMATCH, PROVENANCE_UNAVAILABLE, TRANSIENT_CATEGORIES, GitHubAPI, assess_failure_step_provenance, assess_job, causal_evidence_role, classify_log, detect_side_effect_risk, rerun_decision
+from ci_retry_gate import AMBIGUOUS, CAUSAL, FAILURE_STEP_AMBIGUOUS, FAILURE_STEP_CONFIRMED, FAILURE_STEP_UNAVAILABLE, NON_CAUSAL, PROVENANCE_CONFIRMED, PROVENANCE_MISMATCH, PROVENANCE_UNAVAILABLE, TRANSIENT_CATEGORIES, GitHubAPI, assess_authenticated_runner_annotations, assess_failed_jobs, assess_failure_step_provenance, assess_job, causal_evidence_role, classify_log, detect_side_effect_risk, revalidate_rerun_subject_binding
+from evidence_gate import decide_ci_retry as rerun_decision
+from evidence_producer import produce_ci_evidence_bundle
 
 
 def fake_job(name="tests", steps=None, start="2026-09-17T01:00:00Z", end="2026-09-17T01:04:30Z"):
@@ -32,6 +35,20 @@ def timestamped_network_log(signal_time="2026-09-17T01:01:30.0000000Z"):
     )
 
 
+def evidence_bundle(*assessments, run_attempt=1):
+    return produce_ci_evidence_bundle(
+        repo="owner/repo",
+        run={
+            "head_sha": "abc123",
+            "workflow_id": 99,
+            "updated_at": "2026-09-22T20:10:00Z",
+        },
+        run_id=123,
+        run_attempt=run_attempt,
+        assessments=assessments,
+    )
+
+
 def test_network_transient_high_confidence():
     result = classify_log("""
     npm ERR! code ETIMEDOUT
@@ -39,6 +56,63 @@ def test_network_transient_high_confidence():
     Error: connection reset by peer
     """)
     assert result.category == "DEPENDENCY_NETWORK"
+    assert result.confidence == "high"
+
+
+def test_geophires_526_runner_shutdown_is_not_sufficient_for_auto_rerun():
+    # Ground truth: NatLabRockies/GEOPHIRES-X#526 was closed after an
+    # in-repository lru_cache maxsize reduction fixed the py39 failures.
+    # The terminal GitHub runner shutdown line is therefore not sufficient
+    # evidence that runner infrastructure was the root cause.
+    log = (
+        Path(__file__).parent
+        / "fixtures"
+        / "geophires_x_526_runner_shutdown.log"
+    ).read_text(encoding="utf-8")
+    job = fake_job(
+        "py39 (ubuntu)",
+        [
+            failed_step(
+                "test",
+                start="2026-09-25T15:09:11Z",
+                end="2026-09-25T15:46:07Z",
+            )
+        ],
+        start="2026-09-25T15:08:55Z",
+        end="2026-09-25T15:46:07Z",
+    )
+
+    assessment = assess_job(job, log)
+    safe, reason = rerun_decision(
+        evidence_bundle(assessment, run_attempt=1),
+        max_attempts=2,
+    )
+
+    assert assessment.category == "RUNNER_INFRA"
+    assert assessment.confidence != "high"
+    assert safe is False
+    assert "high-confidence transient" in reason
+
+
+def test_runner_shutdown_exit_143_alone_is_not_high_confidence():
+    result = classify_log(
+        "2026-09-25T15:46:07.2362061Z ##[error]The runner has received a shutdown signal. "
+        "This can happen when the runner service is stopped, or a manually started runner is canceled.\n"
+        "2026-09-25T15:46:07.2364052Z ##[error]Process completed with exit code 143.\n"
+    )
+
+    assert result.category == "RUNNER_INFRA"
+    assert result.confidence != "high"
+
+
+def test_independent_runner_failure_can_still_raise_shutdown_to_high_confidence():
+    result = classify_log(
+        "2026-09-25T15:46:06.9000000Z ##[error]Lost communication with the server.\n"
+        "2026-09-25T15:46:07.2362061Z ##[error]The runner has received a shutdown signal.\n"
+        "2026-09-25T15:46:07.2364052Z ##[error]Process completed with exit code 143.\n"
+    )
+
+    assert result.category == "RUNNER_INFRA"
     assert result.confidence == "high"
 
 
@@ -67,6 +141,15 @@ def test_single_npm_econnreset_is_high_confidence():
     result = classify_log(
         "npm error code ECONNRESET\n"
         "Process completed with exit code 1"
+    )
+    assert result.category == "DEPENDENCY_NETWORK"
+    assert result.confidence == "high"
+
+
+def test_single_curl_dns_error_is_high_confidence():
+    result = classify_log(
+        "curl: (6) Could not resolve host: dependency.example.invalid\n"
+        "Process completed with exit code 6"
     )
     assert result.category == "DEPENDENCY_NETWORK"
     assert result.confidence == "high"
@@ -114,6 +197,8 @@ def test_secret_redaction_in_evidence():
     result = classify_log("token=github_pat_abcdefghijklmnopqrstuvwxyz1234567890 ETIMEDOUT")
     assert result.category == "DEPENDENCY_NETWORK"
     assert all("github_pat_" not in line for line in result.evidence)
+    assert "github_fine_grained_token" in result.fields_redacted
+    assert "credential_assignment" in result.fields_redacted
 
 
 def test_detect_deploy_side_effect():
@@ -131,7 +216,7 @@ def test_detect_publish_step_side_effect():
 def test_safe_rerun_requires_all_failed_jobs_safe():
     a = assess_job(fake_job("install deps"), "ETIMEDOUT\nconnection reset by peer\ncould not resolve host")
     b = assess_job(fake_job("compile"), "AssertionError\nTests failed")
-    safe, reason = rerun_decision([a, b], run_attempt=1, max_attempts=2)
+    safe, reason = rerun_decision(evidence_bundle(a, b, run_attempt=1), max_attempts=2)
     assert safe is False
     assert "compile" in reason
 
@@ -141,7 +226,7 @@ def test_safe_rerun_for_transient_without_side_effects():
         fake_job("install deps", [failed_step()]),
         timestamped_network_log(),
     )
-    safe, reason = rerun_decision([a], run_attempt=1, max_attempts=2)
+    safe, reason = rerun_decision(evidence_bundle(a, run_attempt=1), max_attempts=2)
     assert safe is True
     assert a.provenance_status == PROVENANCE_CONFIRMED
     assert "high-confidence transient" in reason
@@ -149,16 +234,17 @@ def test_safe_rerun_for_transient_without_side_effects():
 
 def test_side_effect_blocks_transient_rerun():
     a = assess_job(fake_job("deploy production"), "ETIMEDOUT\nconnection reset by peer\ncould not resolve host")
-    safe, reason = rerun_decision([a], run_attempt=1, max_attempts=2)
+    safe, reason = rerun_decision(evidence_bundle(a, run_attempt=1), max_attempts=2)
     assert safe is False
     assert "side-effect" in reason
 
 
-def test_attempt_cap_blocks_loop():
+def test_attempt_cap_does_not_override_missing_evidence():
     a = assess_job(fake_job("install deps"), "ETIMEDOUT\nconnection reset by peer\ncould not resolve host")
-    safe, reason = rerun_decision([a], run_attempt=2, max_attempts=2)
+    safe, reason = rerun_decision(evidence_bundle(a, run_attempt=2), max_attempts=2)
     assert safe is False
-    assert "max_attempts" in reason
+    assert "provenance" in reason.lower()
+    assert "max_attempts" not in reason
 
 
 def test_duration_is_measured():
@@ -232,6 +318,64 @@ def test_github_api_does_not_retry_post_on_incomplete_response(monkeypatch):
         raise AssertionError("POST transport interruption must fail closed")
 
     assert api.opener.calls == 1
+
+
+def test_github_api_omits_authorization_without_token():
+    api = GitHubAPI("")
+    opener = _SequenceOpener([_FakeHTTPResponse(body=b'{"ok": true}')])
+    api.opener = opener
+
+    captured = {}
+    original_open = opener.open
+
+    def capture(req, timeout=30):
+        captured["authorization"] = req.get_header("Authorization")
+        return original_open(req, timeout=timeout)
+
+    opener.open = capture
+    result = api.request("GET", "/repos/acme/public")
+
+    assert result == {"ok": True}
+    assert captured["authorization"] is None
+
+
+def test_github_api_repository_metadata_endpoint(monkeypatch):
+    api = GitHubAPI("")
+    seen = []
+
+    def fake_request(method, path, payload=None, accept="application/vnd.github+json"):
+        seen.append((method, path))
+        return {"private": False}
+
+    monkeypatch.setattr(api, "request", fake_request)
+
+    result = api.get_repository("acme/public")
+
+    assert result == {"private": False}
+    assert seen == [("GET", "/repos/acme/public")]
+
+
+def test_github_api_specific_attempt_endpoints(monkeypatch):
+    api = GitHubAPI("token")
+    seen = []
+
+    def fake_request(method, path, payload=None, accept="application/vnd.github+json"):
+        seen.append((method, path))
+        if path.endswith("/jobs?per_page=100"):
+            return {"jobs": [{"id": 42}]}
+        return {"run_attempt": 5}
+
+    monkeypatch.setattr(api, "request", fake_request)
+
+    run = api.get_run_attempt("acme/repo", 123, 5)
+    jobs = api.get_jobs_attempt("acme/repo", 123, 5)
+
+    assert run["run_attempt"] == 5
+    assert jobs == [{"id": 42}]
+    assert seen == [
+        ("GET", "/repos/acme/repo/actions/runs/123/attempts/5"),
+        ("GET", "/repos/acme/repo/actions/runs/123/attempts/5/jobs?per_page=100"),
+    ]
 
 
 def test_requests_httpbin_handshake_timeout_is_not_auto_rerun_transient():
@@ -326,7 +470,7 @@ def test_execution_provenance_fails_closed_without_timestamps():
     assert assessment.confidence == "high"
     assert assessment.provenance_status == PROVENANCE_UNAVAILABLE
 
-    safe, reason = rerun_decision([assessment], run_attempt=1, max_attempts=2)
+    safe, reason = rerun_decision(evidence_bundle(assessment, run_attempt=1), max_attempts=2)
     assert safe is False
     assert "Execution provenance" in reason
 
@@ -345,7 +489,7 @@ def test_execution_provenance_detects_signal_outside_failed_step_window():
     assert assessment.confidence == "high"
     assert assessment.provenance_status == PROVENANCE_MISMATCH
 
-    safe, reason = rerun_decision([assessment], run_attempt=1, max_attempts=2)
+    safe, reason = rerun_decision(evidence_bundle(assessment, run_attempt=1), max_attempts=2)
     assert safe is False
     assert "MISMATCH" in reason
 
@@ -390,7 +534,7 @@ def test_failure_step_provenance_is_independent_from_unknown_classification():
     assert assessment.failure_step_status == FAILURE_STEP_CONFIRMED
     assert assessment.failure_step == "Mystery operation"
 
-    safe, _ = rerun_decision([assessment], run_attempt=1, max_attempts=2)
+    safe, _ = rerun_decision(evidence_bundle(assessment, run_attempt=1), max_attempts=2)
     assert safe is False
 
 
@@ -410,3 +554,428 @@ def test_failure_step_provenance_is_ambiguous_with_multiple_failed_steps():
     assert "Step A" in result.evidence[0]
     assert "Step B" in result.evidence[0]
 
+
+
+class _BindingAPI:
+    def __init__(self, run, jobs):
+        self.run = run
+        self.jobs = jobs
+        self.get_run_calls = 0
+        self.get_jobs_calls = 0
+
+    def get_run(self, repo, run_id):
+        self.get_run_calls += 1
+        return self.run
+
+    def get_jobs(self, repo, run_id):
+        self.get_jobs_calls += 1
+        return self.jobs
+
+
+def _allow_decision_scope():
+    return {
+        "scope": {
+            "repository": "owner/repo",
+            "run_id": 123,
+            "run_attempt": 1,
+            "head_sha": "abc123",
+            "workflow_id": 99,
+        }
+    }
+
+
+def _failed_binding_job(job_id=42):
+    return {
+        "id": job_id,
+        "name": "unit-tests",
+        "conclusion": "failure",
+    }
+
+
+def test_rerun_subject_binding_allows_unchanged_scope():
+    api = _BindingAPI(
+        run={
+            "run_attempt": 1,
+            "head_sha": "abc123",
+            "workflow_id": 99,
+        },
+        jobs=[
+            _failed_binding_job(),
+            {"id": 43, "name": "lint", "conclusion": "success"},
+        ],
+    )
+
+    valid, reason = revalidate_rerun_subject_binding(
+        api,
+        "owner/repo",
+        123,
+        _allow_decision_scope(),
+        [_failed_binding_job()],
+    )
+
+    assert valid is True
+    assert "RERUN_SCOPE_CONFIRMED" in reason
+    assert api.get_run_calls == 1
+    assert api.get_jobs_calls == 1
+
+
+def test_rerun_subject_binding_blocks_when_attempt_advances():
+    api = _BindingAPI(
+        run={
+            "run_attempt": 2,
+            "head_sha": "abc123",
+            "workflow_id": 99,
+        },
+        jobs=[_failed_binding_job()],
+    )
+
+    valid, reason = revalidate_rerun_subject_binding(
+        api,
+        "owner/repo",
+        123,
+        _allow_decision_scope(),
+        [_failed_binding_job()],
+    )
+
+    assert valid is False
+    assert "RERUN_SCOPE_CHANGED" in reason
+    assert "run_attempt 1->2" in reason
+
+
+def test_rerun_subject_binding_blocks_when_head_sha_changes():
+    api = _BindingAPI(
+        run={
+            "run_attempt": 1,
+            "head_sha": "def456",
+            "workflow_id": 99,
+        },
+        jobs=[_failed_binding_job()],
+    )
+
+    valid, reason = revalidate_rerun_subject_binding(
+        api,
+        "owner/repo",
+        123,
+        _allow_decision_scope(),
+        [_failed_binding_job()],
+    )
+
+    assert valid is False
+    assert "head_sha 'abc123'->'def456'" in reason
+
+
+def test_rerun_subject_binding_blocks_when_failed_job_set_changes():
+    api = _BindingAPI(
+        run={
+            "run_attempt": 1,
+            "head_sha": "abc123",
+            "workflow_id": 99,
+        },
+        jobs=[
+            _failed_binding_job(),
+            _failed_binding_job(44),
+        ],
+    )
+
+    valid, reason = revalidate_rerun_subject_binding(
+        api,
+        "owner/repo",
+        123,
+        _allow_decision_scope(),
+        [_failed_binding_job()],
+    )
+
+    assert valid is False
+    assert "failed_job_set" in reason
+
+
+def test_prefixed_curl_transport_failure_is_high_confidence_transient():
+    result = classify_log(
+        "2026-09-05T18:48:22.9603575Z [lint:controller] curl: (35) "
+        "Recv failure: Connection reset by peer\n"
+        "2026-09-05T18:48:22.9659229Z ##[error]Process completed with exit code 201.\n"
+    )
+
+    assert result.category == "DEPENDENCY_NETWORK"
+    assert result.confidence == "high"
+
+
+def test_prefixed_curl_example_in_shell_comment_remains_non_causal():
+    result = classify_log(
+        "# [lint:controller] curl: (35) Recv failure: Connection reset by peer\n"
+    )
+
+    assert result.category == "UNKNOWN"
+    assert result.confidence == "low"
+
+
+def test_explicit_external_registry_502_is_high_confidence_transient():
+    result = classify_log(
+        "2026-09-16T22:05:31.3692870Z ERROR: failed to solve: unexpected status "
+        "from HEAD request to https://registry-1.docker.io/v2/docker/buildkit-syft-scanner/"
+        "manifests/1.11.0: 502 Bad Gateway\n"
+        "2026-09-16T22:05:31.4659302Z ##[error]buildx bake failed with: ERROR: "
+        "failed to solve: unexpected status from HEAD request to "
+        "https://registry-1.docker.io/v2/docker/buildkit-syft-scanner/manifests/1.11.0: "
+        "502 Bad Gateway\n"
+    )
+
+    assert result.category == "DEPENDENCY_NETWORK"
+    assert result.confidence == "high"
+
+
+def test_unanchored_502_prose_does_not_become_high_confidence():
+    result = classify_log(
+        "documentation: unexpected status from HEAD request to "
+        "https://registry.example/v2/example: 502 Bad Gateway\n"
+    )
+
+    assert result.confidence != "high"
+
+
+def _runner_loss_job(name="unit-tests"):
+    return {
+        "id": 98152972844,
+        "name": name,
+        "conclusion": "failure",
+        "status": "completed",
+        "head_sha": "d63e9573daa23943ab666d26a4fe34da8f4deae6",
+        "check_run_url": "https://api.github.com/repos/PRQL/prql/check-runs/98152972844",
+        "started_at": "2026-08-26T11:07:03Z",
+        "completed_at": "2026-08-26T11:55:03Z",
+        "steps": [],
+    }
+
+
+def _runner_loss_check_run(name="unit-tests", **overrides):
+    value = {
+        "id": 98152972844,
+        "name": name,
+        "status": "completed",
+        "conclusion": "failure",
+        "head_sha": "d63e9573daa23943ab666d26a4fe34da8f4deae6",
+        "app": {"slug": "github-actions"},
+    }
+    value.update(overrides)
+    return value
+
+
+def _runner_loss_annotations():
+    return [
+        {
+            "annotation_level": "failure",
+            "message": (
+                "The hosted runner lost communication with the server. Anything in your "
+                "workflow that terminates the runner process, starves it for CPU/Memory, "
+                "or blocks its network access can cause this error."
+            ),
+        }
+    ]
+
+
+def test_authenticated_runner_annotation_binds_exact_job_check_and_head():
+    assessment = assess_authenticated_runner_annotations(
+        _runner_loss_job(),
+        _runner_loss_check_run(),
+        _runner_loss_annotations(),
+    )
+
+    assert assessment is not None
+    assert assessment.category == "RUNNER_INFRA"
+    assert assessment.confidence == "high"
+    assert assessment.provenance_status == PROVENANCE_CONFIRMED
+    assert assessment.failure_step_status == FAILURE_STEP_UNAVAILABLE
+    assert any(
+        "source: authenticated GitHub Checks annotation" == item
+        for item in assessment.provenance_evidence
+    )
+
+    safe, reason = rerun_decision(
+        evidence_bundle(assessment, run_attempt=1),
+        max_attempts=2,
+    )
+    assert safe is True
+    assert "high-confidence transient" in reason
+
+
+def test_prql_runner_loss_annotation_does_not_override_side_effect_boundary():
+    name = "nightly / nightly-release / build-prqlc-c (macos-15, aarch64-apple-darwin)"
+    assessment = assess_authenticated_runner_annotations(
+        _runner_loss_job(name=name),
+        _runner_loss_check_run(name=name),
+        _runner_loss_annotations(),
+    )
+
+    assert assessment is not None
+    assert assessment.provenance_status == PROVENANCE_CONFIRMED
+    assert assessment.side_effect_risk is True
+
+    safe, reason = rerun_decision(
+        evidence_bundle(assessment, run_attempt=1),
+        max_attempts=2,
+    )
+    assert safe is False
+    assert "side-effect" in reason
+
+
+def test_authenticated_runner_annotation_rejects_non_github_actions_check():
+    assessment = assess_authenticated_runner_annotations(
+        _runner_loss_job(),
+        _runner_loss_check_run(app={"slug": "third-party-ci"}),
+        _runner_loss_annotations(),
+    )
+    assert assessment is None
+
+
+def test_authenticated_runner_annotation_rejects_head_sha_mismatch():
+    assessment = assess_authenticated_runner_annotations(
+        _runner_loss_job(),
+        _runner_loss_check_run(head_sha="different"),
+        _runner_loss_annotations(),
+    )
+    assert assessment is None
+
+
+def test_authenticated_runner_annotation_requires_failure_level_and_exact_signal():
+    warning = [{"annotation_level": "warning", "message": _runner_loss_annotations()[0]["message"]}]
+    prose = [{
+        "annotation_level": "failure",
+        "message": "Documentation says the hosted runner lost communication with the server.",
+    }]
+
+    assert assess_authenticated_runner_annotations(
+        _runner_loss_job(), _runner_loss_check_run(), warning
+    ) is None
+    assert assess_authenticated_runner_annotations(
+        _runner_loss_job(), _runner_loss_check_run(), prose
+    ) is None
+
+
+class _RunnerAnnotationAPI:
+    def __init__(self, *, token="token", annotation_error=None):
+        self.token = token
+        self.annotation_error = annotation_error
+
+    def get_job_logs(self, repo, job_id):
+        raise RuntimeError("BlobNotFound: job log was never uploaded")
+
+    def get_check_run(self, repo, check_run_id):
+        if self.annotation_error is not None:
+            raise RuntimeError(self.annotation_error)
+        return _runner_loss_check_run()
+
+    def get_check_run_annotations(self, repo, check_run_id):
+        return _runner_loss_annotations()
+
+
+def test_assess_failed_jobs_uses_authenticated_annotation_when_log_is_missing():
+    assessments = assess_failed_jobs(
+        _RunnerAnnotationAPI(),
+        "PRQL/prql",
+        [_runner_loss_job()],
+    )
+
+    assert len(assessments) == 1
+    assessment = assessments[0]
+    assert assessment.category == "RUNNER_INFRA"
+    assert assessment.confidence == "high"
+    assert assessment.provenance_status == PROVENANCE_CONFIRMED
+
+    safe, _reason = rerun_decision(
+        evidence_bundle(assessment, run_attempt=1),
+        max_attempts=2,
+    )
+    assert safe is True
+
+
+def test_assess_failed_jobs_fails_closed_without_authenticated_token():
+    assessments = assess_failed_jobs(
+        _RunnerAnnotationAPI(token=""),
+        "PRQL/prql",
+        [_runner_loss_job()],
+    )
+
+    assessment = assessments[0]
+    assert assessment.category == "EVIDENCE_UNAVAILABLE"
+    assert assessment.provenance_status == PROVENANCE_UNAVAILABLE
+    assert any("requires a GitHub token" in item for item in assessment.evidence)
+
+
+def test_assess_failed_jobs_uses_public_annotation_in_public_read_only_mode(monkeypatch):
+    monkeypatch.setenv("INPUT_PUBLIC_READ_ONLY", "true")
+
+    assessments = assess_failed_jobs(
+        _RunnerAnnotationAPI(token=""),
+        "PRQL/prql",
+        [_runner_loss_job()],
+    )
+
+    assert len(assessments) == 1
+    assessment = assessments[0]
+    assert assessment.category == "RUNNER_INFRA"
+    assert assessment.confidence == "high"
+    assert assessment.provenance_status == PROVENANCE_CONFIRMED
+    assert any(
+        item == "source: public GitHub Checks annotation"
+        for item in assessment.provenance_evidence
+    )
+
+
+def test_public_annotation_failure_stays_evidence_unavailable(monkeypatch):
+    monkeypatch.setenv("INPUT_PUBLIC_READ_ONLY", "true")
+
+    assessments = assess_failed_jobs(
+        _RunnerAnnotationAPI(
+            token="",
+            annotation_error="GitHub API GET check-run failed with HTTP 403",
+        ),
+        "PRQL/prql",
+        [_runner_loss_job()],
+    )
+
+    assessment = assessments[0]
+    assert assessment.category == "EVIDENCE_UNAVAILABLE"
+    assert assessment.provenance_status == PROVENANCE_UNAVAILABLE
+    assert any("Public check annotation acquisition failed" in item for item in assessment.evidence)
+
+
+def test_assess_failed_jobs_fails_closed_when_checks_permission_is_unavailable():
+    assessments = assess_failed_jobs(
+        _RunnerAnnotationAPI(annotation_error="GitHub API GET check-run failed with HTTP 403"),
+        "PRQL/prql",
+        [_runner_loss_job()],
+    )
+
+    assessment = assessments[0]
+    assert assessment.category == "EVIDENCE_UNAVAILABLE"
+    assert assessment.provenance_status == PROVENANCE_UNAVAILABLE
+    assert any("HTTP 403" in item for item in assessment.evidence)
+
+
+def test_github_api_check_annotation_endpoints_and_pagination(monkeypatch):
+    api = GitHubAPI("token")
+    seen = []
+
+    def fake_request(method, path, payload=None, accept="application/vnd.github+json"):
+        seen.append((method, path))
+        if path == "/repos/acme/repo/check-runs/42":
+            return {"id": 42}
+        if path.endswith("&page=1"):
+            return [{"annotation_level": "notice", "message": str(i)} for i in range(100)]
+        if path.endswith("&page=2"):
+            return [{"annotation_level": "failure", "message": "runner signal"}]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(api, "request", fake_request)
+
+    check_run = api.get_check_run("acme/repo", 42)
+    annotations = api.get_check_run_annotations("acme/repo", 42)
+
+    assert check_run == {"id": 42}
+    assert len(annotations) == 101
+    assert annotations[-1]["message"] == "runner signal"
+    assert seen == [
+        ("GET", "/repos/acme/repo/check-runs/42"),
+        ("GET", "/repos/acme/repo/check-runs/42/annotations?per_page=100&page=1"),
+        ("GET", "/repos/acme/repo/check-runs/42/annotations?per_page=100&page=2"),
+    ]

@@ -1,5 +1,5 @@
-from server5xx_counterexample_search import search_server5xx_counterexamples
-from classifier_rule_research import evaluate_server5xx_shadow_rule
+from runtime.benchmark.server5xx_counterexample_search import search_server5xx_counterexamples
+from runtime.benchmark.classifier_rule_research import evaluate_server5xx_shadow_rule
 from ci_retry_gate import (
     FAILURE_STEP_CONFIRMED,
     assess_failure_step_provenance,
@@ -7,7 +7,7 @@ from ci_retry_gate import (
     detect_side_effect_risk,
 )
 from history_ci_waste import HistoricalFailure
-from pinned_research_corpus import SERDE_ATTESTATION_HTTP_500, TRAEFIK_GOLANGCI_HTTP_504
+from research.corpora.pinned_research_corpus import SERDE_ATTESTATION_HTTP_500, TRAEFIK_GOLANGCI_HTTP_504
 from mechanism_causality_gate import (
     MECHANISM_CAUSAL_CONFIRMED,
     assess_mechanism_causality,
@@ -19,9 +19,9 @@ from transient_mechanism_gate import (
     REASON_SERVER_5XX,
     assess_transient_mechanism,
 )
-from unknown_cause_decomposition import decompose_unknown_cause
-from targeted_replication_search import search_targeted_replication
-from unknown_failure_intelligence import (
+from runtime.benchmark.unknown_cause_decomposition import decompose_unknown_cause
+from runtime.benchmark.targeted_replication_search import search_targeted_replication
+from runtime.benchmark.unknown_failure_intelligence import (
     PROMOTION_BLOCKER_INDEPENDENT_REPLICATION,
     PROMOTION_BLOCKER_INSUFFICIENT_GT_RERUNS,
     PROMOTION_BLOCKER_INSUFFICIENT_OCCURRENCES,

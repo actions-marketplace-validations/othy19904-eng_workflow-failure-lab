@@ -1,0 +1,52 @@
+name: Should I retry this failed GitHub Action?
+description: Paste a public failed run ID. Get a read-only RETRY / INVESTIGATE decision with no install.
+title: "[Public Run Analysis] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Your GitHub Action failed. Before rerunning it, paste the public repository and run ID below.
+
+        CI Retry Gate will inspect the public evidence and return a RETRY / INVESTIGATE decision with the reason.
+
+        **No install. No target-repository token. No rerun. No writes to the target repository.**
+
+  - type: input
+    id: repository
+    attributes:
+      label: Public repository
+      description: Repository that owns the workflow run, in owner/repo form.
+      placeholder: owner/repository
+    validations:
+      required: true
+
+  - type: input
+    id: run_id
+    attributes:
+      label: Workflow run ID
+      description: Numeric GitHub Actions run ID from the public repository.
+      placeholder: "123456789"
+    validations:
+      required: true
+
+  - type: input
+    id: run_attempt
+    attributes:
+      label: Run attempt (optional)
+      description: Leave blank for the current attempt, or enter a historical attempt number such as 1 or 2.
+      placeholder: "1"
+
+  - type: textarea
+    id: context
+    attributes:
+      label: What makes you unsure? (optional)
+      description: Add one sentence if useful. You can leave this blank.
+      placeholder: It looks transient, but I do not want to waste another run or hide a real regression.
+
+  - type: checkboxes
+    id: public_confirmation
+    attributes:
+      label: Public-data confirmation
+      options:
+        - label: I understand this proof surface only analyzes public GitHub Actions data and does not install anything in the target repository.
+          required: true

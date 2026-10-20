@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - id: gate
-        uses: othy19904-eng/workflow-failure-lab@v1
+        uses: achirothmane/workflow-failure-lab@v1
         with:
           github-token: ${{ github.token }}
           run-id: ${{ github.run_id }}
@@ -49,7 +49,7 @@ jobs:
       - id: block
         name: Remote adapter keeps non-quarantined failure red
         continue-on-error: true
-        uses: othy19904-eng/workflow-failure-lab/adapters/pytest@v1
+        uses: achirothmane/workflow-failure-lab/adapters/pytest@v1
         with:
           active-tests-json: '[]'
           test-command: 'python -m pytest e2e/remote-consumer/pytest/test_flaky.py -q'
@@ -70,7 +70,7 @@ jobs:
 
       - id: quarantine
         name: Remote adapter tolerates only ACTIVE failure
-        uses: othy19904-eng/workflow-failure-lab/adapters/pytest@v1
+        uses: achirothmane/workflow-failure-lab/adapters/pytest@v1
         with:
           active-tests-json: ${{ steps.failed-id.outputs.json }}
           test-command: 'python -m pytest e2e/remote-consumer/pytest/test_flaky.py -q'
@@ -98,13 +98,17 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install isolated consumer dependencies
-        run: npm install --prefix e2e/remote-consumer/node --ignore-scripts --no-audit --no-fund
+      - name: Use the verified npm resolver
+        run: npm install --global npm@11.20.0 --ignore-scripts --no-audit --no-fund
+
+      - name: Install locked Jest consumer dependencies
+        working-directory: e2e/remote-consumer/node
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - id: block
         name: Remote adapter keeps non-quarantined failure red
         continue-on-error: true
-        uses: othy19904-eng/workflow-failure-lab/adapters/jest@v1
+        uses: achirothmane/workflow-failure-lab/adapters/jest@v1
         with:
           active-tests-json: '[]'
           working-directory: 'e2e/remote-consumer/node'
@@ -126,7 +130,7 @@ jobs:
 
       - id: quarantine
         name: Remote adapter tolerates only ACTIVE failure
-        uses: othy19904-eng/workflow-failure-lab/adapters/jest@v1
+        uses: achirothmane/workflow-failure-lab/adapters/jest@v1
         with:
           active-tests-json: ${{ steps.failed-id.outputs.json }}
           working-directory: 'e2e/remote-consumer/node'
@@ -155,17 +159,21 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install isolated consumer dependencies
-        run: npm install --prefix e2e/remote-consumer/node --ignore-scripts --no-audit --no-fund
+      - name: Use the verified npm resolver
+        run: npm install --global npm@11.20.0 --ignore-scripts --no-audit --no-fund
+
+      - name: Install locked Vitest consumer dependencies
+        working-directory: e2e/remote-consumer/node/vitest
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - id: block
         name: Remote adapter keeps non-quarantined failure red
         continue-on-error: true
-        uses: othy19904-eng/workflow-failure-lab/adapters/vitest@v1
+        uses: achirothmane/workflow-failure-lab/adapters/vitest@v1
         with:
           active-tests-json: '[]'
-          working-directory: 'e2e/remote-consumer/node'
-          test-command: './node_modules/.bin/vitest run vitest/flaky.test.js'
+          working-directory: 'e2e/remote-consumer/node/vitest'
+          test-command: './node_modules/.bin/vitest run flaky.test.js'
           junit-path: '.remote-e2e/vitest-discover.xml'
           artifact-name: 'remote-v1-vitest-discover'
 
@@ -183,11 +191,11 @@ jobs:
 
       - id: quarantine
         name: Remote adapter tolerates only ACTIVE failure
-        uses: othy19904-eng/workflow-failure-lab/adapters/vitest@v1
+        uses: achirothmane/workflow-failure-lab/adapters/vitest@v1
         with:
           active-tests-json: ${{ steps.failed-id.outputs.json }}
-          working-directory: 'e2e/remote-consumer/node'
-          test-command: './node_modules/.bin/vitest run vitest/flaky.test.js'
+          working-directory: 'e2e/remote-consumer/node/vitest'
+          test-command: './node_modules/.bin/vitest run flaky.test.js'
           junit-path: '.remote-e2e/vitest-quarantine.xml'
           artifact-name: 'remote-v1-vitest-quarantine'
 

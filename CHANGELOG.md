@@ -4,12 +4,180 @@ All notable changes to CI Retry Gate are documented here.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-06
+
+### Added
+
+- Durable decision/effect audit artifacts for the installed Action path, including decision-record and outcome/reconciliation surfaces that keep pre-effect authorization distinct from later observed outcome.
+- Deferred effect execution so admitted reruns can be durably recorded before the mutation path proceeds.
+- Live verification fixtures for crash windows, lease contention, executor takeover, audit-chain replay/receipt loss, ABA-style token resurrection, and external monotonic-root behavior.
+- A first-class product adoption surface: 5-minute quickstart, copy-ready examples, product architecture, technical reference, support guidance, contributor guide, pull-request template, and structured bug/feature intake.
+
+### Changed
+
+- Repository structure now separates product runtime, research, and release/regression validation behind explicit boundaries.
+- Benchmark and flaky-test implementation detail moved under `runtime/` while stable root entry points remain reachable by the Action and adapters.
+- CI now enforces that product runtime cannot depend on `research/` or `validation/`.
+- Public Incident Replay assets now live under `validation/public_incidents/`, and the current replay gate covers 11 admitted public incidents.
+- Causal-dominance falsification assets and pinned research corpora now live under `research/`.
+
+### Safety
+
+- Automatic rerun and selective rerun remain explicit opt-in.
+- Missing, stale, contradictory, or insufficient evidence still fails closed.
+- Side-effect boundaries remain independent blockers.
+- Research, validation, benchmark, and historical-flakiness evidence do not silently grant production retry authority.
+- Causal Dominance remains research-only and is not imported by production retry entry points.
+
+### Verification
+
+- The release candidate must pass repository CI, Compatibility Matrix, Remote v1 Consumer E2E, Public Incident Replay, clean-install verification, and release-readiness verification.
+- Repository-boundary tests protect the product/runtime -> research/validation dependency direction.
+- The published `@v1` consumer path remains covered separately from source-tree tests.
+
+## [1.4.1] - 2026-10-01
+
+### Changed
+
+- Zero-install public analysis can now use unauthenticated GitHub Checks metadata and annotations as a narrowly bound fallback when public job-log download is unavailable.
+
+### Safety
+
+- Public annotation fallback is limited to `INPUT_PUBLIC_READ_ONLY=true`, retains exact check-run/job/head/conclusion/app binding, and never grants write capability to the target repository.
+
+### Verification
+
+- Live external activation probing confirmed public repository/run/job/check-run/annotation metadata is readable without target credentials while public job-log download remains HTTP 403.
+- End-to-end zero-install validation confirms the public annotation fallback does not require a target token and retains fail-closed behavior.
+
+
+## [1.4.0] - 2026-10-01
+
+### Added
+
+- Decision Experience v1: a compact user-facing decision card with final decision, evidence status, deterministic next action, observed failed runtime, and rerun-eligible/blocked job counts.
+- Report-only Fleet Report action for recent completed workflow runs, including rerun-eligible/blocked counts, blocker reasons, observed failed runtime, and ground-truth candidate outcomes when available.
+- Setup Doctor copy-ready activation generation, including `activation-ready`, `recommended-config`, and a complete `activation-workflow` output bound to an explicit source workflow name.
+- Descriptive-only `decision-experience-json` and operator/value outputs for downstream reporting.
+
+### Changed
+
+- Value reporting now explicitly distinguishes observed failed-job runtime from counterfactual CI savings; no saved-minute claim is emitted without later evidence.
+
+### Safety
+
+- Decision Experience is descriptive-only and cannot grant retry authority.
+- Fleet Report is report-only and cannot mutate workflow runs, comments, Issues, or quarantine state.
+- Setup Doctor generates activation YAML but never writes it into the target repository.
+- Automatic and selective reruns remain explicit opt-in.
+
+### Verification
+
+- The v1.4.0 release candidate must pass CI, Compatibility Matrix, Remote v1 Consumer E2E, Public Incident Replay, clean-install verification, and release-readiness verification.
+
+
+## [1.3.0] - 2026-09-30
+
+### Added
+
+- Public Incident Corpus and executable Public Incident Replay Gate covering nine source-backed GitHub Actions incidents across nine repositories.
+- Bidirectional replay controls: known bounded transient failures must remain ALLOW while ambiguous, unsafe, recurrent, or authority-insufficient incidents must remain BLOCK.
+- Mechanism-diverse replay coverage for connection resets, external HTTP 5xx, network unreachable, hosted-runner loss, runner-shutdown ambiguity, workload/resource pressure, and persistent rate limiting.
+- Authenticated GitHub Checks annotation fallback for runner-loss evidence when the ordinary job log blob is unavailable.
+- Exact check-run evidence binding across check-run ID, workflow job name, head SHA, conclusion, GitHub Actions app identity, and failure-level annotation.
+- Setup Doctor preflight for `checks: read`, including an explicit `checks-read-access` output.
+- Evidence-before-Action integration artifacts for CI retry execution: ActionRequest, AssumptionState, AuthorityGrant, Decision, and ExecutionReceipt.
+- Canonical JSON, temporal-admissibility, contextual-scope, assumption, authority, and governed-action conformance suites.
+- Historical Flakiness Evidence Producer and shadow evaluation that can surface strictly-prior recovery evidence without changing production retry authority.
+
+### Changed
+
+- Terminal runner shutdown / exit-143 symptoms no longer reach high-confidence transient authorization without independent runner-origin evidence.
+- The dependency/network classifier now recognizes source-backed task-prefixed curl transport failures and explicit operational external 502/503/504 request failures.
+- Public Incident Replay is now a required CI gate before the Python test suite.
+- Setup Doctor recommendations include `checks: read` and use the current `achirothmane/workflow-failure-lab@v1` action owner.
+- Runner-loss annotation evidence can improve execution provenance without overriding side-effect boundaries or retry-attempt limits.
+
+### Safety
+
+- Public replay requires 100% corpus coverage, zero false ALLOW, and zero false BLOCK decisions for the current admitted corpus.
+- Authenticated annotation evidence fails closed on missing token, Checks API failure, binding mismatch, third-party check app, non-failure annotation, or unrecognized annotation text.
+- Retrospective root-cause knowledge is kept separate from decision-time evidence.
+- A stronger evidence source does not automatically grant execution authority: side-effect boundaries, exact state binding, attempt caps, and Evidence Gate policy remain independent.
+- Causal Dominance remains research-only and is still excluded from production retry authority.
+
+### Verification
+
+- Public Incident Replay v4 exercises nine public incidents from nine independent repositories with four expected ALLOW and five expected BLOCK controls.
+- External consumer validation demonstrated strictly-prior historical flakiness support while production authorization remained BLOCK / UNKNOWN.
+- The release candidate must pass CI, Compatibility Matrix, Remote v1 Consumer E2E, clean-install verification, and release-readiness verification before tagging.
+
+
+## [1.2.0] - 2026-09-27
+
+### Added
+
+- EASL-compatible subject-state binding layer for domain-neutral pre-mutation state equality checks.
+- Canonical subject-state conformance vectors vendored from EASL and executed by the Python compatibility test suite.
+- Exact pre-mutation subject revalidation for legacy full-workflow auto-rerun across repository, run ID, run attempt, head SHA, workflow ID, and failed-job set.
+- Exact pre-mutation workflow/job revalidation for Selective Safe Rerun across run attempt, head SHA, workflow ID, workflow lifecycle, and failed job execution identity.
+
+### Changed
+
+- Selective Safe Rerun now performs at most one job rerun mutation per evaluated workflow-state epoch. Remaining safe candidates require a fresh evaluation after the first accepted mutation changes workflow state.
+- Subject-state drift fails closed before mutation instead of reusing authorization produced from an older workflow snapshot.
+- The stable v1 release smoke workflow now consumes the current `achirothmane/workflow-failure-lab@v1` owner path.
+
+### Safety
+
+- Mutating GitHub API POST requests remain single-attempt on transport ambiguity; they are not blindly replayed.
+- Structural state-binding errors and unavailable pre-mutation state reads fail closed.
+- EASL remains a compatibility invariant only; CI retry policy, GitHub-specific identity, and mutation semantics stay inside CI Retry Gate.
+- Causal Dominance remains research/shadow-only. Production promotion for Causal Dominance remains blocked at 2/3 independent real positive controls.
+
+### Verification
+
+- CI, Compatibility Matrix, and Remote v1 Consumer E2E passed for the state-binding and conformance changes.
+- External consumer proof run `36323452061` validated two selective-safe candidates, exactly one real rerun mutation, one copied untouched GitHub job, and zero second mutation after re-evaluation at the configured attempt cap.
+
+
+## [1.1.0] - 2026-09-26
+
+### Added
+
+- Policy-free CI Evidence Producer with explicit OBSERVED, DERIVED, INFERRED, and evidence-quality layers.
+- Canonical `evidence-producer.ci.v1` EvidenceBundle contract for retry authorization.
+- Canonical `*.evidence.json` runtime artifacts with deterministic serialization and SHA-256 integrity verification.
+- Separate-process Evidence Gate CLI so authorization consumes persisted evidence rather than in-memory assessment objects.
+- New Action outputs: `evidence-bundle-path` and `evidence-bundle-sha256` for audit, replay, and downstream verification.
+
+### Changed
+
+- CI Retry Gate now consumes EvidenceBundle as its evidence boundary instead of reading `JobAssessment` directly.
+- Retry policy remains outside the evidence artifact, preserving the distinction between observed evidence and execution authority.
+- Missing, malformed, conflicting, or tampered evidence fails closed to BLOCK.
+- Recovery and recurrence checks remain conservative outer guards: they can narrow an ALLOW to BLOCK but cannot create authorization.
+
+### Verification
+
+- 353 Python tests pass, including artifact tamper detection and process-boundary authorization tests.
+- CI, pytest/Jest/Vitest Compatibility Matrix, Remote v1 Consumer E2E, clean-install verification, and Release Readiness all pass on the release candidate.
+
+
+## [1.0.2] - 2026-09-24
+
 ### Added
 
 - Setup Doctor composite action at `/doctor@v1` with READY/WARN/BLOCKED onboarding diagnostics.
 - Framework detection for pytest, Jest, and Vitest, including fail-closed Jest `jest-junit` validation.
 - Read-only checks for JUnit artifact wiring, GitHub API read access, ownership routing, quarantine manifests, and recommended feature permissions.
 - Monorepo-safe `working-directory`, GitHub step-summary guidance, and a generated production configuration.
+
+### Changed
+
+- PR comments are now explicit opt-in: `comment-on-pr` defaults to `false` in both the Action contract and runtime fallback.
+- README installation examples and badges now use the current `achirothmane` repository owner.
+- Release-readiness checks now enforce the read-only comment default and current repository identity.
 
 ## [1.0.1] - 2026-09-19
 

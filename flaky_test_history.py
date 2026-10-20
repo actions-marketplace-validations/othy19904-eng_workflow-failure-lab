@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import zipfile
@@ -8,25 +9,30 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from ci_retry_gate import GitHubAPI, _bool_env, _event_payload
-from flaky_issue_lifecycle import MAX_ISSUE_CHANGES, manage_issue_lifecycle
-from flaky_ownership import (
+from runtime.flaky.flaky_issue_lifecycle import MAX_ISSUE_CHANGES, manage_issue_lifecycle
+from runtime.flaky.flaky_ownership import (
     load_codeowners_from_github,
     load_ownership_map_from_github,
     resolve_ownership,
 )
-from flaky_quarantine_lifecycle import (
+from runtime.flaky.flaky_quarantine_lifecycle import (
     active_test_ids_json,
     evaluate_lifecycle,
     load_manifest_from_github,
     render_lifecycle_report,
 )
-from flaky_test_intelligence import (
+from runtime.flaky.flaky_test_intelligence import (
     CaseObservation,
     FlakyTestSummary,
     observations_from_junit,
     summarize_flaky_tests,
 )
-from flaky_triage import (
+from runtime.flaky.historical_flakiness_evidence import produce_historical_flakiness_evidence
+from runtime.flaky.historical_flakiness_shadow import (
+    compare_historical_flakiness_shadow,
+    render_historical_flakiness_shadow,
+)
+from runtime.flaky.flaky_triage import (
     build_triage_items,
     emit_triage_annotations,
     render_triage_report,
@@ -59,6 +65,74 @@ def _artifact_attempt(name: str, run_attempt: int) -> int | None:
     if run_attempt == 1:
         return 1
     return None
+
+
+def _parse_artifact_time(value: str) -> datetime | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _attempt_metadata(
+    api: GitHubAPI,
+    repo: str,
+    run: dict,
+) -> dict[int, dict]:
+    run_id = int(run.get("id") or 0)
+    run_attempt = max(1, int(run.get("run_attempt") or 1))
+    if not run_id:
+        return {}
+
+    if run_attempt == 1:
+        return {1: run}
+
+    result: dict[int, dict] = {}
+    for attempt in range(1, run_attempt + 1):
+        try:
+            result[attempt] = api.request(
+                "GET",
+                f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}",
+            )
+        except RuntimeError:
+            return {}
+    return result
+
+
+def _artifact_attempt_from_metadata(
+    name: str,
+    run_attempt: int,
+    artifact_created_at: str,
+    attempt_metadata: dict[int, dict],
+) -> int | None:
+    explicit = _artifact_attempt(name, run_attempt)
+    if explicit is not None:
+        return explicit
+    if run_attempt <= 1:
+        return 1
+
+    created_at = _parse_artifact_time(artifact_created_at)
+    if created_at is None or not attempt_metadata:
+        return None
+
+    candidates: list[int] = []
+    for attempt, metadata in sorted(attempt_metadata.items()):
+        start = _parse_artifact_time(str(metadata.get("run_started_at") or ""))
+        end = _parse_artifact_time(str(metadata.get("updated_at") or ""))
+        if start is None or end is None or end < start:
+            continue
+        if start <= created_at <= end:
+            candidates.append(attempt)
+
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
 
 
 def _xml_members(blob: bytes) -> tuple[tuple[str, str], ...]:
@@ -140,10 +214,28 @@ def collect_flaky_history(
         ]
         artifacts_seen += len(artifacts)
 
+        needs_temporal_binding = (
+            run_attempt > 1
+            and any(
+                _artifact_attempt(str(item.get("name") or ""), run_attempt) is None
+                for item in artifacts
+            )
+        )
+        attempt_metadata = (
+            _attempt_metadata(api, repo, run)
+            if needs_temporal_binding
+            else {}
+        )
+
         for artifact in artifacts:
             artifact_id = int(artifact.get("id") or 0)
             name = str(artifact.get("name") or "")
-            attempt = _artifact_attempt(name, run_attempt)
+            attempt = _artifact_attempt_from_metadata(
+                name,
+                run_attempt,
+                str(artifact.get("created_at") or ""),
+                attempt_metadata,
+            )
             if not artifact_id:
                 continue
             if attempt is None:
@@ -169,6 +261,12 @@ def collect_flaky_history(
                         run_id=run_id,
                         attempt=attempt,
                         job_name=name or "junit",
+                        observed_at=str(
+                            (attempt_metadata.get(attempt) or run).get("run_started_at")
+                            or (attempt_metadata.get(attempt) or run).get("updated_at")
+                            or (attempt_metadata.get(attempt) or run).get("created_at")
+                            or ""
+                        ),
                     )
                 )
 
@@ -308,7 +406,31 @@ def main() -> int:
         print(f"::warning::Flaky Test Intelligence could not analyze artifacts: {exc}")
         return 0
 
-    report = render_flaky_history_report(result)
+    run_attempt = max(1, int(current_run.get("run_attempt") or 1))
+    historical_evidence = produce_historical_flakiness_evidence(
+        repo=repo,
+        current_run=current_run,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        result=result,
+    )
+    historical_shadow = compare_historical_flakiness_shadow(
+        repo=repo,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        observations=result.case_observations,
+        baseline_decision=os.environ.get("INPUT_BASELINE_DECISION", ""),
+        baseline_evidence_status=os.environ.get(
+            "INPUT_BASELINE_EVIDENCE_STATUS",
+            "",
+        ),
+    )
+
+    report = (
+        render_flaky_history_report(result)
+        + "\n"
+        + render_historical_flakiness_shadow(historical_shadow)
+    )
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as handle:
@@ -480,6 +602,23 @@ def main() -> int:
     _write_output("quarantine-candidates", str(candidates))
     _write_output("junit-artifacts-analyzed", str(result.artifacts_analyzed))
     _write_output("flaky-estimated-waste-minutes", f"{waste_minutes:.2f}")
+    _write_output(
+        "historical-flakiness-evidence-json",
+        json.dumps(historical_evidence, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output(
+        "historical-flakiness-shadow-json",
+        json.dumps(historical_shadow, separators=(",", ":"), sort_keys=True),
+    )
+    _write_output("historical-flakiness-shadow-status", historical_shadow["shadow"]["status"])
+    _write_output(
+        "historical-flakiness-shadow-supported-tests",
+        str(historical_shadow["shadow"]["tests_with_historical_support"]),
+    )
+    _write_output(
+        "historical-flakiness-shadow-contradictions",
+        str(historical_shadow["shadow"]["tests_with_historical_contradiction"]),
+    )
     _write_output("active-quarantines", str(active_count))
     _write_output("expired-quarantines", str(expired_count))
     _write_output("auto-released-quarantines", str(released_count))
